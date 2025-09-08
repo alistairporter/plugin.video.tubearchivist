@@ -1,0 +1,22 @@
+<addon id="plugin.video.tubearchivist"
+       name="Tube Archivist"
+       version="0.1.0"
+       provider-name="Alistair Porter"
+       type="xbmc.python.pluginsource">
+    <requires>
+        <import addon="xbmc.python" version="3.0.0"/>
+    </requires>
+    <extension point="xbmc.python.pluginsource" library="default.py">
+        <provides>video</provides>
+    </extension>
+    <extension point="xbmc.addon.metadata">
+        <summary>Tube Archivist Kodi Add-on</summary>
+        <description>Browse and play your Tube Archivist library from Kodi.</description>
+        <platform>all</platform>
+        <assets>
+            <icon>resources/media/icon.png</icon>
+            <fanart>resources/media/fanart.jpg</fanart>
+        </assets>
+    </extension>
+</addon>
+

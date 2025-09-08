@@ -1,0 +1,26 @@
+<settings>
+    <category label="Connection">
+        <setting id="server_url"
+                 type="text"
+                 label="Tube Archivist Server URL"
+                 default="http://localhost:8000" />
+        <setting id="api_token"
+                 type="text"
+                 label="API Token"
+                 option="hidden" />
+    </category>
+
+    <category label="Sorting">
+        <setting id="sort_order"
+                 type="enum"
+                 label="Video Sort Order"
+                 values="Newest First|Oldest First|Alphabetical A-Z|Alphabetical Z-A"
+                 default="0" />
+        <setting id="max_videos"
+                 type="number"
+                 label="Max videos to load"
+                 default="50"
+                 range="10,500"
+                 step="25" />
+    </category>
+</settings>
