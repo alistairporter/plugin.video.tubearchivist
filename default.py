@@ -169,9 +169,24 @@ def list_channels():
 
     xbmcplugin.endOfDirectory(HANDLE)
     
-def list_playlists(page=1):
-    data = ta.paged("playlist/", page)
+def list_playlists(page=1, update_listing=False):
+    """
+    List all playlists using API pagination.
+    Fetches only the requested page for better performance.
+
+    Args:
+        page: Page number to fetch
+        update_listing: If True, append to existing list instead of replacing
+    """
+    # Fetch single page from API
+    data = ta.get(f"playlist/?page={page}")
     items = data.get("data", [])
+    paginate = data.get("paginate", {})
+
+    current_page = paginate.get("current_page", 1)
+    last_page = paginate.get("last_page", 1)
+    total_hits = paginate.get("total_hits", len(items))
+
     for pl in items:
         label = pl.get("playlist_name", "Unnamed Playlist")
         # API returns playlist_thumbnail, not playlist_thumb_url
@@ -182,14 +197,17 @@ def list_playlists(page=1):
         url = build_url({"action": "list_playlist_videos", "id": pl.get("playlist_id")})
         xbmcplugin.addDirectoryItem(HANDLE, url, li, isFolder=True)
 
-    paginate = data.get("paginate", {})
-    if paginate.get("next_pages"):
-        next_page = paginate["next_pages"][0]
-        li = xbmcgui.ListItem(label=f"Next Page → ({next_page})")
-        url = build_url({"action": "list_playlists", "page": str(next_page)})
-        xbmcplugin.addDirectoryItem(HANDLE, url, li, isFolder=True)
+    # Navigation - Load More button that appends items
+    if current_page < last_page:
+        load_more_url = build_url({
+            "action": "list_playlists",
+            "page": str(current_page + 1),
+            "update": "1"
+        })
+        load_more_label = f"[Load More... ({current_page + 1}/{last_page}) - {total_hits} total playlists]"
+        xbmcplugin.addDirectoryItem(HANDLE, load_more_url, xbmcgui.ListItem(label=load_more_label), isFolder=True)
 
-    xbmcplugin.endOfDirectory(HANDLE)
+    xbmcplugin.endOfDirectory(HANDLE, updateListing=update_listing)
 
 def _local_sort(videos, sort_choice):
     """Sort TA video dicts locally using the user's setting."""
@@ -210,7 +228,15 @@ def _local_sort(videos, sort_choice):
         return videos
 
 
-def list_channel_videos(channel_id, page=1):
+def list_channel_videos(channel_id, page=1, update_listing=False):
+    """
+    List videos for a channel with client-side sorting and pagination.
+
+    Args:
+        channel_id: The channel ID
+        page: Page number to display
+        update_listing: Not used, kept for compatibility
+    """
     sort_choice = get_sort_order()
     max_per_page = int(addon.getSetting("max_videos") or 50)
 
@@ -231,12 +257,18 @@ def list_channel_videos(channel_id, page=1):
     # 2) Sort locally
     all_videos = _local_sort(all_videos, sort_choice)
 
-    # 3) Client-side paginate based on Max videos
+    # 3) Slice to show only the current page
     total = len(all_videos)
     total_pages = max(1, math.ceil(total / max_per_page))
     page = max(1, min(page, total_pages))
-    start, end = (page - 1) * max_per_page, (page - 1) * max_per_page + max_per_page
+
+    start = (page - 1) * max_per_page
+    end = page * max_per_page
     page_slice = all_videos[start:end]
+
+    current_page = page
+    last_page = total_pages
+    total_hits = total
 
     xbmcplugin.setContent(HANDLE, "videos")
 
@@ -274,15 +306,17 @@ def list_channel_videos(channel_id, page=1):
 
         xbmcplugin.addDirectoryItem(HANDLE, play, li, isFolder=False)
 
-    # 5) Navigation
-    if page < total_pages:
-        next_url = f"{sys.argv[0]}?action=list_channel_videos&id={channel_id}&page={page+1}"
-        xbmcplugin.addDirectoryItem(HANDLE, next_url, xbmcgui.ListItem(label=f">> Next Page ({page+1}/{total_pages})"), isFolder=True)
-    if page > 1:
-        prev_url = f"{sys.argv[0]}?action=list_channel_videos&id={channel_id}&page={page-1}"
-        xbmcplugin.addDirectoryItem(HANDLE, prev_url, xbmcgui.ListItem(label=f"<< Previous Page ({page-1}/{total_pages})"), isFolder=True)
+    # Navigation - Next page button
+    if current_page < last_page:
+        next_url = build_url({
+            "action": "list_channel_videos",
+            "id": channel_id,
+            "page": str(current_page + 1)
+        })
+        next_label = f"Next Page ({current_page + 1}/{last_page}) →"
+        xbmcplugin.addDirectoryItem(HANDLE, next_url, xbmcgui.ListItem(label=next_label), isFolder=True)
 
-    xbmcplugin.endOfDirectory(HANDLE)
+    xbmcplugin.endOfDirectory(HANDLE, cacheToDisc=False)
 
 
 
@@ -326,7 +360,15 @@ def list_channel_playlists(channel_id):
 
     xbmcplugin.endOfDirectory(HANDLE)
 
-def list_playlist_videos(playlist_id, page=1):
+def list_playlist_videos(playlist_id, page=1, update_listing=False):
+    """
+    List videos for a playlist with client-side sorting and pagination.
+
+    Args:
+        playlist_id: The playlist ID
+        page: Page number to display
+        update_listing: Not used, kept for compatibility
+    """
     sort_choice = get_sort_order()
     max_per_page = int(addon.getSetting("max_videos") or 50)
 
@@ -347,12 +389,18 @@ def list_playlist_videos(playlist_id, page=1):
     # 2) Sort locally
     all_videos = _local_sort(all_videos, sort_choice)
 
-    # 3) Client-side paginate based on Max videos
+    # 3) Slice to show only the current page
     total = len(all_videos)
     total_pages = max(1, math.ceil(total / max_per_page))
     page = max(1, min(page, total_pages))
-    start, end = (page - 1) * max_per_page, (page - 1) * max_per_page + max_per_page
+
+    start = (page - 1) * max_per_page
+    end = page * max_per_page
     page_slice = all_videos[start:end]
+
+    current_page = page
+    last_page = total_pages
+    total_hits = total
 
     xbmcplugin.setContent(HANDLE, "videos")
 
@@ -387,17 +435,26 @@ def list_playlist_videos(playlist_id, page=1):
 
         xbmcplugin.addDirectoryItem(HANDLE, play, li, isFolder=False)
 
-    # 5) Navigation
-    if page < total_pages:
-        next_url = f"{sys.argv[0]}?action=list_playlist_videos&id={playlist_id}&page={page+1}"
-        xbmcplugin.addDirectoryItem(HANDLE, next_url, xbmcgui.ListItem(label=f">> Next Page ({page+1}/{total_pages})"), isFolder=True)
-    if page > 1:
-        prev_url = f"{sys.argv[0]}?action=list_playlist_videos&id={playlist_id}&page={page-1}"
-        xbmcplugin.addDirectoryItem(HANDLE, prev_url, xbmcgui.ListItem(label=f"<< Previous Page ({page-1}/{total_pages})"), isFolder=True)
+    # Navigation - Next page button
+    if current_page < last_page:
+        next_url = build_url({
+            "action": "list_playlist_videos",
+            "id": playlist_id,
+            "page": str(current_page + 1)
+        })
+        next_label = f"Next Page ({current_page + 1}/{last_page}) →"
+        xbmcplugin.addDirectoryItem(HANDLE, next_url, xbmcgui.ListItem(label=next_label), isFolder=True)
 
-    xbmcplugin.endOfDirectory(HANDLE)
+    xbmcplugin.endOfDirectory(HANDLE, cacheToDisc=False)
 
-def list_partial_videos(page=1):
+def list_partial_videos(page=1, update_listing=False):
+    """
+    List in-progress videos with client-side sorting and pagination.
+
+    Args:
+        page: Page number to display
+        update_listing: Not used, kept for compatibility
+    """
     sort_choice = get_sort_order()
     max_per_page = int(addon.getSetting("max_videos") or 50)
 
@@ -418,12 +475,18 @@ def list_partial_videos(page=1):
     # 2) Sort locally
     all_videos = _local_sort(all_videos, sort_choice)
 
-    # 3) Client-side paginate based on Max videos
+    # 3) Slice to show only the current page
     total = len(all_videos)
     total_pages = max(1, math.ceil(total / max_per_page))
     page = max(1, min(page, total_pages))
-    start, end = (page - 1) * max_per_page, (page - 1) * max_per_page + max_per_page
+
+    start = (page - 1) * max_per_page
+    end = page * max_per_page
     page_slice = all_videos[start:end]
+
+    current_page = page
+    last_page = total_pages
+    total_hits = total
 
     xbmcplugin.setContent(HANDLE, "videos")
 
@@ -458,64 +521,59 @@ def list_partial_videos(page=1):
 
         xbmcplugin.addDirectoryItem(HANDLE, play, li, isFolder=False)
 
-    # 5) Navigation
-    if page < total_pages:
-        next_url = f"{sys.argv[0]}?action=list_videos&watch=continue&page={page+1}"
-        xbmcplugin.addDirectoryItem(HANDLE, next_url, xbmcgui.ListItem(label=f">> Next Page ({page+1}/{total_pages})"), isFolder=True)
-    if page > 1:
-        prev_url = f"{sys.argv[0]}?action=list_videos&watch=continue&page={page-1}"
-        xbmcplugin.addDirectoryItem(HANDLE, prev_url, xbmcgui.ListItem(label=f"<< Previous Page ({page-1}/{total_pages})"), isFolder=True)
+    # Navigation - Next page button
+    if current_page < last_page:
+        next_url = build_url({
+            "action": "list_partial_videos",
+            "page": str(current_page + 1)
+        })
+        next_label = f"Next Page ({current_page + 1}/{last_page}) →"
+        xbmcplugin.addDirectoryItem(HANDLE, next_url, xbmcgui.ListItem(label=next_label), isFolder=True)
 
-    xbmcplugin.endOfDirectory(HANDLE)
+    xbmcplugin.endOfDirectory(HANDLE, cacheToDisc=False)
 
-def list_videos(page=1):
-    sort_choice   = get_sort_order()
-    max_per_page  = int(addon.getSetting("max_videos") or 50)
-    block_target  = 250  # ~items per fetch block
-    want_start    = (page - 1) * max_per_page
-    want_end      = want_start + max_per_page
+def list_videos(page=1, update_listing=False):
+    """
+    List recent videos with client-side sorting and pagination.
+
+    Args:
+        page: Page number to display
+        update_listing: Not used, kept for compatibility
+    """
+    sort_choice = get_sort_order()
+    max_per_page = int(addon.getSetting("max_videos") or 50)
 
     xbmcplugin.setContent(HANDLE, "videos")
 
-    all_videos = []
-    cur_page   = 1
+    # 1) Pull ALL pages from TA
+    all_videos, cur = [], 1
+    while True:
+        data = ta.get(f"video/?page={cur}")
+        vids = data.get("data", [])
+        if not vids:
+            break
+        all_videos.extend(vids)
+        paginate = data.get("paginate") or {}
+        last_page = int(paginate.get("last_page", cur))
+        if cur >= last_page:
+            break
+        cur += 1
 
-    # First page (also learn page_size/last_page)
-    # Try to ask the API nicely for a larger page size if it supports it.
-    # If TA ignores unknown params, this is harmless.
-    first = ta.get(f"video/?page=1&sort=published&page_size={block_target}")
-    vids  = first.get("data", []) or []
-    all_videos.extend(vids)
-
-    paginate  = first.get("paginate") or {}
-    page_size = int(paginate.get("page_size", len(vids) or 12))
-    last_page = int(paginate.get("last_page", 1))
-
-    # Compute how many API pages roughly make ~250 items
-    pages_per_block = max(1, math.ceil(block_target / max(1, page_size)))
-
-    # If we don’t yet have enough items to cover the current Kodi page,
-    # fetch additional blocks (each ~250 items) until we do, or we run out.
-    while len(all_videos) < want_end and cur_page < last_page:
-        # Fetch up to pages_per_block pages per loop
-        for _ in range(pages_per_block):
-            cur_page += 1
-            if cur_page > last_page:
-                break
-            data = ta.get(f"video/?sort=published&page={cur_page}")
-            all_videos.extend(data.get("data", []) or [])
-
-        # Update page_size/last_page if the API tells us different numbers mid-run
-        paginate  = data.get("paginate") or paginate
-        page_size = int(paginate.get("page_size", page_size))
-        last_page = int(paginate.get("last_page", last_page))
-
-    # Local sort the fetched window, then slice to the requested Kodi page.
-    # NOTE: If you need globally perfect sort across ALL items, you must
-    # fetch everything; this is a fast/partial strategy for speed.
+    # 2) Sort locally
     all_videos = _local_sort(all_videos, sort_choice)
 
-    page_slice = all_videos[want_start:want_end]
+    # 3) Slice to show only the current page
+    total = len(all_videos)
+    total_pages = max(1, math.ceil(total / max_per_page))
+    page = max(1, min(page, total_pages))
+
+    start = (page - 1) * max_per_page
+    end = page * max_per_page
+    page_slice = all_videos[start:end]
+
+    current_page = page
+    last_page = total_pages
+    total_hits = total
 
     # Render items with context menu
     for video in page_slice:
@@ -548,52 +606,16 @@ def list_videos(page=1):
 
         xbmcplugin.addDirectoryItem(HANDLE, play, li, isFolder=False)
 
-    # Navigation (we can still show Next/Prev based on what *Kodi* page the user is on)
-    # We won’t know the true total without crawling all pages; instead, be pragmatic:
-    # show "Next" if API says there are more server pages past what we’ve consumed.
-    # If you prefer the old page-count UI, keep your total_pages math and full crawl.
-    have_more_server_pages = (cur_page < last_page) or (len(all_videos) >= want_end and cur_page <= last_page)
-    if have_more_server_pages:
-        next_url = f"{sys.argv[0]}?action=list_videos&page={page+1}"
-        xbmcplugin.addDirectoryItem(HANDLE, next_url,
-            xbmcgui.ListItem(label=f">> Next Page"), isFolder=True)
-    if page > 1:
-        prev_url = f"{sys.argv[0]}?action=list_videos&page={page-1}"
-        xbmcplugin.addDirectoryItem(HANDLE, prev_url,
-            xbmcgui.ListItem(label=f"<< Previous Page"), isFolder=True)
+    # Navigation - Next page button
+    if current_page < last_page:
+        next_url = build_url({
+            "action": "list_videos",
+            "page": str(current_page + 1)
+        })
+        next_label = f"Next Page ({current_page + 1}/{last_page}) →"
+        xbmcplugin.addDirectoryItem(HANDLE, next_url, xbmcgui.ListItem(label=next_label), isFolder=True)
 
-    xbmcplugin.endOfDirectory(HANDLE)
-    
-# def list_videos(page=1):
-#     data = ta.paged("video/", page)
-#     items = data.get("data", [])
-#     for v in items:
-#         play_video_item(v)
-
-#     # Pagination
-#     paginate = data.get("paginate", {})
-#     if paginate.get("next_pages"):
-#         next_page = paginate["next_pages"][0]
-#         li = xbmcgui.ListItem(label=f"Next Page → ({next_page})")
-#         url = build_url({"action": "list_videos", "page": str(next_page)})
-#         xbmcplugin.addDirectoryItem(HANDLE, url, li, isFolder=True)
-
-#     xbmcplugin.endOfDirectory(HANDLE)
-
-
-def play_video_item(video):
-    title = video.get("title") or video.get("video_title", "Untitled")
-    plot = video.get("description") or video.get("video_description", "")
-    thumb = ta.fix_url(video.get("thumbnail_url") or video.get("video_thumb_url"))
-    url = ta.fix_url(video.get("url") or video.get("media_url") or video.get("video_url", ""))
-
-    li = xbmcgui.ListItem(label=title)
-    li.setInfo("video", {"title": title, "plot": plot})
-    if thumb:
-        li.setArt({"thumb": thumb, "icon": thumb, "fanart": thumb})
-    li.setProperty("IsPlayable", "true")
-
-    xbmcplugin.addDirectoryItem(HANDLE, url, li, isFolder=False)
+    xbmcplugin.endOfDirectory(HANDLE, cacheToDisc=False)
 
 def _get_first(d, *keys, default=None):
     """Safe helper: return first existing key from d."""
@@ -835,17 +857,22 @@ if __name__ == "__main__":
     elif action == "list_channels":
         list_channels()
     elif action == "list_playlists":
-        list_playlists(page)
+        update_listing = params.get("update") == "1"
+        list_playlists(page, update_listing)
     elif action == "list_channel_videos":
-        list_channel_videos(params["id"], int(params.get("page", "1")))
+        update_listing = params.get("update") == "1"
+        list_channel_videos(params["id"], int(params.get("page", "1")), update_listing)
     elif action == "list_channel_playlists":
         list_channel_playlists(params["id"])
     elif action == "list_playlist_videos":
-        list_playlist_videos(params["id"], int(params.get("page", "1")))
+        update_listing = params.get("update") == "1"
+        list_playlist_videos(params["id"], int(params.get("page", "1")), update_listing)
     elif action == "list_partial_videos":
-        list_partial_videos(int(params.get("page", "1")))
+        update_listing = params.get("update") == "1"
+        list_partial_videos(int(params.get("page", "1")), update_listing)
     elif action == "list_videos":
-        list_videos(page)
+        update_listing = params.get("update") == "1"
+        list_videos(page, update_listing)
     elif action == "search":
         search(int(params.get("page", "1")))
     elif action == "play":
