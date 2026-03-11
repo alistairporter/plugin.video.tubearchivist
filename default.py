@@ -22,7 +22,7 @@ def root_menu():
         ("Channels", {"action": "list_channels"}),
         ("Playlists", {"action": "list_playlists"}),
         ("In Progress Videos", {"action": "list_partial_videos"}),
-        ("All Videos", {"action": "list_videos"}),
+        ("Recent Videos", {"action": "list_videos"}),
         ("Search", {"action": "search"}),
     ]
     for label, q in items:
@@ -152,10 +152,19 @@ def list_channels():
         thumb  = ta.server_url + (ch.get("channel_thumb_url") or "")
         banner = ta.server_url + (ch.get("channel_banner_url") or "")
         fanart = ta.server_url + (ch.get("channel_tvart_url") or "")
+        ch_id  = ch.get("channel_id")
 
         li = xbmcgui.ListItem(label=label)
         li.setArt({"thumb": thumb, "icon": thumb, "banner": banner, "fanart": fanart})
-        url = build_url({"action": "list_channel_videos", "id": ch.get("channel_id")})
+
+        # Add context menu for playlists
+        context_menu = []
+        if ch_id:
+            playlists_url = build_url({"action": "list_channel_playlists", "id": ch_id})
+            context_menu.append(("View Channel Playlists", f"Container.Update({playlists_url})"))
+            li.addContextMenuItems(context_menu)
+
+        url = build_url({"action": "list_channel_videos", "id": ch_id})
         xbmcplugin.addDirectoryItem(HANDLE, url, li, isFolder=True)
 
     xbmcplugin.endOfDirectory(HANDLE)
@@ -165,7 +174,8 @@ def list_playlists(page=1):
     items = data.get("data", [])
     for pl in items:
         label = pl.get("playlist_name", "Unnamed Playlist")
-        thumb = ta.fix_url(pl.get("playlist_thumb_url"))
+        # API returns playlist_thumbnail, not playlist_thumb_url
+        thumb = ta.fix_url(pl.get("playlist_thumbnail") or pl.get("playlist_thumb_url"))
         li = xbmcgui.ListItem(label=label)
         if thumb:
             li.setArt({"thumb": thumb, "icon": thumb, "fanart": thumb})
@@ -230,14 +240,13 @@ def list_channel_videos(channel_id, page=1):
 
     xbmcplugin.setContent(HANDLE, "videos")
 
-    # 4) Render items
+    # 4) Render items with context menu
     for video in page_slice:
         title = video.get("title", "Untitled")
         desc  = video.get("description", "")
         thumb = ta.server_url + (video.get("vid_thumb_url") or "")
-        # play  = ta.server_url + (video.get("media_url") or "")
         play = f"{sys.argv[0]}?action=play&yid={video.get('youtube_id')}"
-
+        ch_id = video.get("channel", {}).get("channel_id") if isinstance(video.get("channel"), dict) else None
 
         li = xbmcgui.ListItem(label=title)
         info = li.getVideoInfoTag()
@@ -248,7 +257,21 @@ def list_channel_videos(channel_id, page=1):
         li.setProperty("IsPlayable", "true")
 
         _apply_playback_meta(li, video)
-        
+
+        # Add context menu for going to channel
+        context_menu = []
+        if ch_id:
+            go_to_channel_url = build_url({"action": "list_channel_videos", "id": ch_id})
+            context_menu.append(("Go to Channel", f"Container.Update({go_to_channel_url})"))
+
+        # Add playlists menu
+        if ch_id:
+            channel_playlists_url = build_url({"action": "list_channel_playlists", "id": ch_id})
+            context_menu.append(("View Channel Playlists", f"Container.Update({channel_playlists_url})"))
+
+        if context_menu:
+            li.addContextMenuItems(context_menu)
+
         xbmcplugin.addDirectoryItem(HANDLE, play, li, isFolder=False)
 
     # 5) Navigation
@@ -261,6 +284,47 @@ def list_channel_videos(channel_id, page=1):
 
     xbmcplugin.endOfDirectory(HANDLE)
 
+
+
+def list_channel_playlists(channel_id):
+    """List all playlists for a specific channel."""
+    # Fetch all playlists and filter by channel
+    all_playlists = []
+    cur = 1
+
+    while True:
+        data = ta.get(f"playlist/?page={cur}")
+        items = data.get("data", [])
+        if not items:
+            break
+        all_playlists.extend(items)
+        paginate = data.get("paginate") or {}
+        last_page = int(paginate.get("last_page", cur))
+        if cur >= last_page:
+            break
+        cur += 1
+
+    # Filter playlists that belong to this channel
+    channel_playlists = [
+        pl for pl in all_playlists
+        if pl.get("playlist_channel_id") == channel_id
+    ]
+
+    if not channel_playlists:
+        li = xbmcgui.ListItem(label="No playlists found for this channel")
+        xbmcplugin.addDirectoryItem(HANDLE, "", li, isFolder=False)
+    else:
+        for pl in channel_playlists:
+            label = pl.get("playlist_name", "Unnamed Playlist")
+            # API returns playlist_thumbnail, not playlist_thumb_url
+            thumb = ta.fix_url(pl.get("playlist_thumbnail") or pl.get("playlist_thumb_url"))
+            li = xbmcgui.ListItem(label=label)
+            if thumb:
+                li.setArt({"thumb": thumb, "icon": thumb, "fanart": thumb})
+            url = build_url({"action": "list_playlist_videos", "id": pl.get("playlist_id")})
+            xbmcplugin.addDirectoryItem(HANDLE, url, li, isFolder=True)
+
+    xbmcplugin.endOfDirectory(HANDLE)
 
 def list_playlist_videos(playlist_id, page=1):
     sort_choice = get_sort_order()
@@ -292,14 +356,13 @@ def list_playlist_videos(playlist_id, page=1):
 
     xbmcplugin.setContent(HANDLE, "videos")
 
-    # 4) Render items
+    # 4) Render items with context menu
     for video in page_slice:
         title = video.get("title", "Untitled")
         desc  = video.get("description", "")
         thumb = ta.server_url + (video.get("vid_thumb_url") or "")
-        # play  = ta.server_url + (video.get("media_url") or "")
         play = f"{sys.argv[0]}?action=play&yid={video.get('youtube_id')}"
-
+        ch_id = video.get("channel", {}).get("channel_id") if isinstance(video.get("channel"), dict) else None
 
         li = xbmcgui.ListItem(label=title)
         info = li.getVideoInfoTag()
@@ -310,6 +373,17 @@ def list_playlist_videos(playlist_id, page=1):
         li.setProperty("IsPlayable", "true")
 
         _apply_playback_meta(li, video)
+
+        # Add context menu for going to channel
+        context_menu = []
+        if ch_id:
+            go_to_channel_url = build_url({"action": "list_channel_videos", "id": ch_id})
+            context_menu.append(("Go to Channel", f"Container.Update({go_to_channel_url})"))
+            channel_playlists_url = build_url({"action": "list_channel_playlists", "id": ch_id})
+            context_menu.append(("View Channel Playlists", f"Container.Update({channel_playlists_url})"))
+
+        if context_menu:
+            li.addContextMenuItems(context_menu)
 
         xbmcplugin.addDirectoryItem(HANDLE, play, li, isFolder=False)
 
@@ -327,7 +401,7 @@ def list_partial_videos(page=1):
     sort_choice = get_sort_order()
     max_per_page = int(addon.getSetting("max_videos") or 50)
 
-    # 1) Pull ALL pages from TA for this playlist
+    # 1) Pull ALL pages from TA
     all_videos, cur = [], 1
     while True:
         data = ta.get(f"video/?watch=continue&page={cur}")
@@ -353,14 +427,13 @@ def list_partial_videos(page=1):
 
     xbmcplugin.setContent(HANDLE, "videos")
 
-    # 4) Render items
+    # 4) Render items with context menu
     for video in page_slice:
         title = video.get("title", "Untitled")
         desc  = video.get("description", "")
         thumb = ta.server_url + (video.get("vid_thumb_url") or "")
-        # play  = ta.server_url + (video.get("media_url") or "")
         play = f"{sys.argv[0]}?action=play&yid={video.get('youtube_id')}"
-
+        ch_id = video.get("channel", {}).get("channel_id") if isinstance(video.get("channel"), dict) else None
 
         li = xbmcgui.ListItem(label=title)
         info = li.getVideoInfoTag()
@@ -371,6 +444,17 @@ def list_partial_videos(page=1):
         li.setProperty("IsPlayable", "true")
 
         _apply_playback_meta(li, video)
+
+        # Add context menu for going to channel
+        context_menu = []
+        if ch_id:
+            go_to_channel_url = build_url({"action": "list_channel_videos", "id": ch_id})
+            context_menu.append(("Go to Channel", f"Container.Update({go_to_channel_url})"))
+            channel_playlists_url = build_url({"action": "list_channel_playlists", "id": ch_id})
+            context_menu.append(("View Channel Playlists", f"Container.Update({channel_playlists_url})"))
+
+        if context_menu:
+            li.addContextMenuItems(context_menu)
 
         xbmcplugin.addDirectoryItem(HANDLE, play, li, isFolder=False)
 
@@ -433,14 +517,13 @@ def list_videos(page=1):
 
     page_slice = all_videos[want_start:want_end]
 
-    # Render items
+    # Render items with context menu
     for video in page_slice:
         title = video.get("title", "Untitled")
         desc  = video.get("description", "")
         thumb = ta.server_url + (video.get("vid_thumb_url") or "")
-        # play  = ta.server_url + (video.get("media_url") or "")
         play = f"{sys.argv[0]}?action=play&yid={video.get('youtube_id')}"
-
+        ch_id = video.get("channel", {}).get("channel_id") if isinstance(video.get("channel"), dict) else None
 
         li   = xbmcgui.ListItem(label=title)
         info = li.getVideoInfoTag()
@@ -451,6 +534,18 @@ def list_videos(page=1):
         li.setProperty("IsPlayable", "true")
 
         _apply_playback_meta(li, video)
+
+        # Add context menu for going to channel
+        context_menu = []
+        if ch_id:
+            go_to_channel_url = build_url({"action": "list_channel_videos", "id": ch_id})
+            context_menu.append(("Go to Channel", f"Container.Update({go_to_channel_url})"))
+            channel_playlists_url = build_url({"action": "list_channel_playlists", "id": ch_id})
+            context_menu.append(("View Channel Playlists", f"Container.Update({channel_playlists_url})"))
+
+        if context_menu:
+            li.addContextMenuItems(context_menu)
+
         xbmcplugin.addDirectoryItem(HANDLE, play, li, isFolder=False)
 
     # Navigation (we can still show Next/Prev based on what *Kodi* page the user is on)
@@ -552,7 +647,7 @@ def search(page=1):
         if not pl_id:
             continue
         pl_name  = _get_first(pl, "playlist_name", "title", default="Playlist")
-        pl_thumb = ta.server_url + (_get_first(pl, "playlist_thumb_url", "thumb", default="") or "")
+        pl_thumb = ta.server_url + (_get_first(pl, "playlist_thumbnail", "playlist_thumb_url", "thumb", default="") or "")
         pl_fan   = ta.server_url + (_get_first(pl, "playlist_banner_url", "fanart", default="") or "")
         # Optional: show number of items if available
         count    = _get_first(pl, "playlist_entries", "entries", "count")
@@ -584,9 +679,8 @@ def search(page=1):
         title = video.get("title", "Untitled")
         desc  = video.get("description", "")
         thumb = ta.server_url + (video.get("vid_thumb_url") or "")
-        # play  = ta.server_url + (video.get("media_url") or "")
         play = f"{sys.argv[0]}?action=play&yid={video.get('youtube_id')}"
-
+        ch_id = video.get("channel", {}).get("channel_id") if isinstance(video.get("channel"), dict) else None
 
         li = xbmcgui.ListItem(label=title)
         info = li.getVideoInfoTag()
@@ -597,7 +691,18 @@ def search(page=1):
         li.setProperty("IsPlayable", "true")
 
         _apply_playback_meta(li, video)
-         
+
+        # Add context menu for going to channel
+        context_menu = []
+        if ch_id:
+            go_to_channel_url = build_url({"action": "list_channel_videos", "id": ch_id})
+            context_menu.append(("Go to Channel", f"Container.Update({go_to_channel_url})"))
+            channel_playlists_url = build_url({"action": "list_channel_playlists", "id": ch_id})
+            context_menu.append(("View Channel Playlists", f"Container.Update({channel_playlists_url})"))
+
+        if context_menu:
+            li.addContextMenuItems(context_menu)
+
         xbmcplugin.addDirectoryItem(HANDLE, play, li, isFolder=False)
 
     # optional: if the API ever sends a 'paginate' block, add simple next-page
@@ -733,6 +838,8 @@ if __name__ == "__main__":
         list_playlists(page)
     elif action == "list_channel_videos":
         list_channel_videos(params["id"], int(params.get("page", "1")))
+    elif action == "list_channel_playlists":
+        list_channel_playlists(params["id"])
     elif action == "list_playlist_videos":
         list_playlist_videos(params["id"], int(params.get("page", "1")))
     elif action == "list_partial_videos":
