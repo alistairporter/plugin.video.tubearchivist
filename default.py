@@ -23,7 +23,7 @@ def root_menu():
         ("Playlists", {"action": "list_playlists"}),
         ("In Progress Videos", {"action": "list_partial_videos"}),
         ("Recent Videos", {"action": "list_videos"}),
-        ("Search", {"action": "search"}),
+        ("Search", {"action": "search_menu"}),
     ]
     for label, q in items:
         li = xbmcgui.ListItem(label=label)
@@ -624,15 +624,39 @@ def _get_first(d, *keys, default=None):
             return d[k]
     return default
 
-def search(page=1):
+def search_menu():
+    """Show search type selection menu."""
+    items = [
+        ("Search All", {"action": "search", "type": "all"}),
+        ("Search Videos", {"action": "search", "type": "video"}),
+        ("Search Channels", {"action": "search", "type": "channel"}),
+        ("Search Playlists", {"action": "search", "type": "playlist"}),
+    ]
+    for label, params in items:
+        li = xbmcgui.ListItem(label=label)
+        url = build_url(params)
+        xbmcplugin.addDirectoryItem(HANDLE, url, li, isFolder=True)
+    xbmcplugin.endOfDirectory(HANDLE)
+
+def search(page=1, search_type="all"):
+    """
+    Search Tube Archivist content.
+
+    Args:
+        page: Page number for pagination
+        search_type: Type of content to search for ("all", "video", "channel", "playlist")
+    """
     # read query from URL or prompt
     params = dict(urllib.parse.parse_qsl(sys.argv[2][1:])) if len(sys.argv) > 2 else {}
     q = params.get("q")
     if not q:
-        q = xbmcgui.Dialog().input("Search Tube Archivist")
+        search_type_label = {"all": "All", "video": "Videos", "channel": "Channels", "playlist": "Playlists"}.get(search_type, "All")
+        q = xbmcgui.Dialog().input(f"Search {search_type_label}")
     if not q:
         xbmcplugin.endOfDirectory(HANDLE)
         return
+
+    xbmc.log(f"TubeArchivist: searching for '{q}' (type: {search_type}, page {page})", xbmc.LOGINFO)
 
     sort_choice  = get_sort_order()
     max_per_page = int(addon.getSetting("max_videos") or 50)
@@ -640,107 +664,143 @@ def search(page=1):
     enc_q = urllib.parse.quote(q)
     try:
         payload = ta.get(f"search/?query={enc_q}&page={page}") or {}
+        xbmc.log(f"TubeArchivist: search returned {len(payload.get('results', {}))} result types", xbmc.LOGDEBUG)
     except Exception as e:
         xbmc.log(f"TubeArchivist: search api error: {e}", xbmc.LOGERROR)
-        payload = {}
+        li = xbmcgui.ListItem(label=f"Search error: {e}")
+        xbmcplugin.addDirectoryItem(HANDLE, "", li, isFolder=False)
+        xbmcplugin.endOfDirectory(HANDLE)
+        return
 
     results = payload.get("results") or {}
     video_results    = results.get("video_results") or []
     channel_results  = results.get("channel_results") or []
     playlist_results = results.get("playlist_results") or []
 
+    xbmc.log(f"TubeArchivist: search found {len(channel_results)} channels, {len(playlist_results)} playlists, {len(video_results)} videos", xbmc.LOGINFO)
+
+    xbmcplugin.setContent(HANDLE, "videos")
+
+    # Filter results based on search type
+    show_channels = search_type in ("all", "channel")
+    show_playlists = search_type in ("all", "playlist")
+    show_videos = search_type in ("all", "video")
+
     # --- channels (folders) ---
-    for ch in channel_results:
-        ch_id    = _get_first(ch, "channel_id", "id")
-        if not ch_id:
-            continue
-        ch_name  = _get_first(ch, "channel_name", "title", default="Channel")
-        ch_thumb = ta.server_url + (_get_first(ch, "channel_thumb_url", "thumb", default="") or "")
-        ch_fan   = ta.server_url + (_get_first(ch, "channel_banner_url", "channel_tvart_url", "fanart", default="") or "")
+    if show_channels:
+        for ch in channel_results:
+            ch_id    = _get_first(ch, "channel_id", "id")
+            if not ch_id:
+                continue
+            ch_name  = _get_first(ch, "channel_name", "title", default="Channel")
+            ch_thumb = ta.server_url + (_get_first(ch, "channel_thumb_url", "thumb", default="") or "")
+            ch_fan   = ta.server_url + (_get_first(ch, "channel_banner_url", "channel_tvart_url", "fanart", default="") or "")
 
-        url = f'{sys.argv[0]}?action=list_channel_videos&id={urllib.parse.quote(ch_id)}'
-        li = xbmcgui.ListItem(label=f"[CHANNEL] {ch_name}")
-        li.setArt({"thumb": ch_thumb, "icon": ch_thumb, "fanart": ch_fan})
-        xbmcplugin.addDirectoryItem(HANDLE, url, li, isFolder=True)
+            url = build_url({"action": "list_channel_videos", "id": ch_id})
+            li = xbmcgui.ListItem(label=f"[CHANNEL] {ch_name}")
+            li.setArt({"thumb": ch_thumb, "icon": ch_thumb, "fanart": ch_fan})
 
-    # --- playlists (folders) ---
-    for pl in playlist_results:
-        pl_id    = _get_first(pl, "playlist_id", "id")
-        if not pl_id:
-            continue
-        pl_name  = _get_first(pl, "playlist_name", "title", default="Playlist")
-        pl_thumb = ta.server_url + (_get_first(pl, "playlist_thumbnail", "playlist_thumb_url", "thumb", default="") or "")
-        pl_fan   = ta.server_url + (_get_first(pl, "playlist_banner_url", "fanart", default="") or "")
-        # Optional: show number of items if available
-        count    = _get_first(pl, "playlist_entries", "entries", "count")
-        if isinstance(count, list):
-            count = len(count)
-        suffix = f" ({count})" if isinstance(count, int) and count > 0 else ""
-        url = f'{sys.argv[0]}?action=list_playlist_videos&id={urllib.parse.quote(pl_id)}'
-        li = xbmcgui.ListItem(label=f"[PLAYLIST] {pl_name}{suffix}")
-        li.setArt({"thumb": pl_thumb, "icon": pl_thumb, "fanart": pl_fan})
-        xbmcplugin.addDirectoryItem(HANDLE, url, li, isFolder=True)
-
-    # --- videos (items) ---
-    try:
-        videos_sorted = _local_sort(video_results, sort_choice)
-    except Exception:
-        key_map = {
-            "date":   lambda v: v.get("published") or "",
-            "title":  lambda v: v.get("title") or "",
-            "length": lambda v: (v.get("player") or {}).get("duration") or 0,
-            "views":  lambda v: (v.get("stats") or {}).get("view_count") or 0,
-        }
-        reverse = sort_choice in ("date", "views", "length")
-        key_fn  = key_map.get(sort_choice, key_map["date"])
-        videos_sorted = sorted(video_results, key=key_fn, reverse=reverse)
-
-    videos_to_render = videos_sorted[:max_per_page]
-
-    for video in videos_to_render:
-        title = video.get("title", "Untitled")
-        desc  = video.get("description", "")
-        thumb = ta.server_url + (video.get("vid_thumb_url") or "")
-        play = f"{sys.argv[0]}?action=play&yid={video.get('youtube_id')}"
-        ch_id = video.get("channel", {}).get("channel_id") if isinstance(video.get("channel"), dict) else None
-
-        li = xbmcgui.ListItem(label=title)
-        info = li.getVideoInfoTag()
-        info.setTitle(title)
-        info.setPlot(desc)
-        if thumb:
-            li.setArt({"thumb": thumb, "icon": thumb, "fanart": thumb})
-        li.setProperty("IsPlayable", "true")
-
-        _apply_playback_meta(li, video)
-
-        # Add context menu for going to channel
-        context_menu = []
-        if ch_id:
-            go_to_channel_url = build_url({"action": "list_channel_videos", "id": ch_id})
-            context_menu.append(("Go to Channel", f"Container.Update({go_to_channel_url})"))
-            channel_playlists_url = build_url({"action": "list_channel_playlists", "id": ch_id})
-            context_menu.append(("View Channel Playlists", f"Container.Update({channel_playlists_url})"))
-
-        if context_menu:
+            # Add context menu for channel playlists
+            context_menu = []
+            playlists_url = build_url({"action": "list_channel_playlists", "id": ch_id})
+            context_menu.append(("View Channel Playlists", f"Container.Update({playlists_url})"))
             li.addContextMenuItems(context_menu)
 
-        xbmcplugin.addDirectoryItem(HANDLE, play, li, isFolder=False)
+            xbmcplugin.addDirectoryItem(HANDLE, url, li, isFolder=True)
 
-    # optional: if the API ever sends a 'paginate' block, add simple next-page
+    # --- playlists (folders) ---
+    if show_playlists:
+        for pl in playlist_results:
+            pl_id    = _get_first(pl, "playlist_id", "id")
+            if not pl_id:
+                continue
+            pl_name  = _get_first(pl, "playlist_name", "title", default="Playlist")
+            pl_thumb = ta.server_url + (_get_first(pl, "playlist_thumbnail", "playlist_thumb_url", "thumb", default="") or "")
+            pl_fan   = ta.server_url + (_get_first(pl, "playlist_banner_url", "fanart", default="") or "")
+            # Optional: show number of items if available
+            count    = _get_first(pl, "playlist_entries", "entries", "count")
+            if isinstance(count, list):
+                count = len(count)
+            suffix = f" ({count})" if isinstance(count, int) and count > 0 else ""
+            url = build_url({"action": "list_playlist_videos", "id": pl_id})
+            li = xbmcgui.ListItem(label=f"[PLAYLIST] {pl_name}{suffix}")
+            li.setArt({"thumb": pl_thumb, "icon": pl_thumb, "fanart": pl_fan})
+            xbmcplugin.addDirectoryItem(HANDLE, url, li, isFolder=True)
+
+    # --- videos (items) ---
+    if show_videos:
+        try:
+            videos_sorted = _local_sort(video_results, sort_choice)
+        except Exception:
+            key_map = {
+                "date":   lambda v: v.get("published") or "",
+                "title":  lambda v: v.get("title") or "",
+                "length": lambda v: (v.get("player") or {}).get("duration") or 0,
+                "views":  lambda v: (v.get("stats") or {}).get("view_count") or 0,
+            }
+            reverse = sort_choice in ("date", "views", "length")
+            key_fn  = key_map.get(sort_choice, key_map["date"])
+            videos_sorted = sorted(video_results, key=key_fn, reverse=reverse)
+
+        videos_to_render = videos_sorted[:max_per_page]
+
+        for video in videos_to_render:
+            title = video.get("title", "Untitled")
+            desc  = video.get("description", "")
+            thumb = ta.server_url + (video.get("vid_thumb_url") or "")
+            yid   = video.get('youtube_id')
+            play  = build_url({"action": "play", "yid": yid})
+            ch_id = video.get("channel", {}).get("channel_id") if isinstance(video.get("channel"), dict) else None
+
+            li = xbmcgui.ListItem(label=title)
+            info = li.getVideoInfoTag()
+            info.setTitle(title)
+            info.setPlot(desc)
+            if thumb:
+                li.setArt({"thumb": thumb, "icon": thumb, "fanart": thumb})
+            li.setProperty("IsPlayable", "true")
+
+            _apply_playback_meta(li, video)
+
+            # Add context menu for going to channel
+            context_menu = []
+            if ch_id:
+                go_to_channel_url = build_url({"action": "list_channel_videos", "id": ch_id})
+                context_menu.append(("Go to Channel", f"Container.Update({go_to_channel_url})"))
+                channel_playlists_url = build_url({"action": "list_channel_playlists", "id": ch_id})
+                context_menu.append(("View Channel Playlists", f"Container.Update({channel_playlists_url})"))
+
+            if context_menu:
+                li.addContextMenuItems(context_menu)
+
+            xbmcplugin.addDirectoryItem(HANDLE, play, li, isFolder=False)
+
+    # Pagination - check if there are more results
     paginate = payload.get("paginate") or {}
     next_pages = paginate.get("next_pages") or []
-    if next_pages:
+    current_page = paginate.get("current_page", page)
+
+    if next_pages and len(next_pages) > 0:
         next_page = next_pages[0]
-        url = f'{sys.argv[0]}?action=search&q={urllib.parse.quote(q)}&page={next_page}'
-        li = xbmcgui.ListItem(label=f"Next page → ({next_page})")
+        url = build_url({"action": "search", "q": q, "type": search_type, "page": str(next_page)})
+        li = xbmcgui.ListItem(label=f"Next Page ({next_page}) →")
         xbmcplugin.addDirectoryItem(HANDLE, url, li, isFolder=True)
 
-    if not (channel_results or playlist_results or videos_to_render):
-        li = xbmcgui.ListItem(label=f"No results for: {q}")
+    # Show "no results" message if nothing found
+    total_results = 0
+    if show_channels:
+        total_results += len(channel_results)
+    if show_playlists:
+        total_results += len(playlist_results)
+    if show_videos:
+        total_results += len(videos_to_render) if 'videos_to_render' in locals() else 0
+
+    if total_results == 0:
+        search_type_label = {"all": "", "video": " videos", "channel": " channels", "playlist": " playlists"}.get(search_type, "")
+        li = xbmcgui.ListItem(label=f"No{search_type_label} results for: {q}")
         xbmcplugin.addDirectoryItem(HANDLE, "", li, isFolder=False)
 
-    xbmcplugin.endOfDirectory(HANDLE)
+    xbmcplugin.endOfDirectory(HANDLE, cacheToDisc=False)
 
 # ---------- TA scrobble helpers ----------
 def _ta_mark_progress(video_id: str, position: int):
@@ -873,8 +933,11 @@ if __name__ == "__main__":
     elif action == "list_videos":
         update_listing = params.get("update") == "1"
         list_videos(page, update_listing)
+    elif action == "search_menu":
+        search_menu()
     elif action == "search":
-        search(int(params.get("page", "1")))
+        search_type = params.get("type", "all")
+        search(int(params.get("page", "1")), search_type)
     elif action == "play":
         handle_play()
         sys.exit(0)
