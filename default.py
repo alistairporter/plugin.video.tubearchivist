@@ -14,6 +14,9 @@ addon = xbmcaddon.Addon()
 HANDLE = int(sys.argv[1])
 ta = TubeArchivist()
 
+# Get the plugin base URL
+PLUGIN_URL = sys.argv[0]
+
 def build_url(query):
     """Build a plugin URL from a query dict."""
     return sys.argv[0] + "?" + urllib.parse.urlencode(query)
@@ -31,8 +34,31 @@ def add_channel_context_menu(li, channel_id):
         channel_id: The channel ID
     """
     context_menu = []
+
+    # Play All Videos from this channel
+    play_all_url = build_url({"action": "play_all", "list_id": f"channel:{channel_id}"})
+    context_menu.append(("Play All", f"RunPlugin({play_all_url})"))
+
+    # View Channel Playlists
     playlists_url = build_url({"action": "list_channel_playlists", "id": channel_id})
     context_menu.append(("View Channel Playlists", f"Container.Update({playlists_url})"))
+
+    li.addContextMenuItems(context_menu)
+
+def add_playlist_context_menu(li, playlist_id):
+    """
+    Add context menu items for a playlist.
+
+    Args:
+        li: The ListItem to add context menu to
+        playlist_id: The playlist ID
+    """
+    context_menu = []
+
+    # Play All Videos from this playlist
+    play_all_url = build_url({"action": "play_all", "list_id": f"playlist:{playlist_id}"})
+    context_menu.append(("Play All", f"RunPlugin({play_all_url})"))
+
     li.addContextMenuItems(context_menu)
 
 def add_video_context_menu(li, channel_id):
@@ -53,12 +79,15 @@ def add_video_context_menu(li, channel_id):
     context_menu.append(("View Channel Playlists", f"Container.Update({channel_playlists_url})"))
     li.addContextMenuItems(context_menu)
 
-def create_video_listitem(video):
+def create_video_listitem(video, add_play_from_here=False, video_list_id=None, video_index=None):
     """
     Create a Kodi ListItem for a video with all metadata and context menu.
 
     Args:
         video: Video dict from Tube Archivist API
+        add_play_from_here: If True, add "Play from Here" context menu
+        video_list_id: Identifier for the video list (e.g., "channel:ID" or "playlist:ID")
+        video_index: Index of this video in the list
 
     Returns:
         tuple: (ListItem, play_url)
@@ -81,7 +110,75 @@ def create_video_listitem(video):
     _apply_playback_meta(li, video)
     add_video_context_menu(li, ch_id)
 
+    # Add "Play from Here" if in a list context
+    if add_play_from_here and video_list_id and video_index is not None:
+        play_from_url = build_url({
+            "action": "play_from_here",
+            "list_id": video_list_id,
+            "index": str(video_index)
+        })
+        li.addContextMenuItems([("Play from Here", f"RunPlugin({play_from_url})")], True)
+
     return li, play_url
+
+def play_all_videos(videos, start_index=0):
+    """
+    Create a Kodi playlist from videos and start playing.
+
+    Args:
+        videos: List of video dicts from Tube Archivist API
+        start_index: Index to start playing from (default 0)
+    """
+    if not videos:
+        xbmc.log("TubeArchivist: No videos to play", xbmc.LOGWARNING)
+        return
+
+    # Get the video playlist
+    playlist = xbmc.PlayList(xbmc.PLAYLIST_VIDEO)
+    playlist.clear()
+
+    xbmc.log(f"TubeArchivist: Creating playlist with {len(videos)} videos, starting at {start_index}", xbmc.LOGINFO)
+
+    # Add all videos to playlist starting from start_index
+    for i, video in enumerate(videos[start_index:], start=start_index):
+        yid = video.get('youtube_id')
+        if not yid:
+            continue
+
+        # Fetch the video to get the media URL
+        try:
+            data = ta.get(f"video/{yid}/")
+            video_data = (data.get("data") or data) if isinstance(data, dict) else {}
+            media_url = ta.server_url + (video_data.get("media_url") or "")
+
+            if not video_data.get("media_url"):
+                xbmc.log(f"TubeArchivist: No media_url for video {yid}", xbmc.LOGWARNING)
+                continue
+
+            title = video.get("title", "Untitled")
+            thumb = ta.server_url + (video.get("vid_thumb_url") or "")
+
+            li = xbmcgui.ListItem(label=title)
+            li.setPath(media_url)
+            if thumb:
+                li.setArt({"thumb": thumb, "icon": thumb, "fanart": thumb})
+
+            info = li.getVideoInfoTag()
+            info.setTitle(title)
+            info.setPlot(video.get("description", ""))
+
+            playlist.add(media_url, li)
+            xbmc.log(f"TubeArchivist: Added video {i}: {title}", xbmc.LOGDEBUG)
+
+        except Exception as e:
+            xbmc.log(f"TubeArchivist: Failed to add video {yid} to playlist: {e}", xbmc.LOGWARNING)
+
+    # Start playing the playlist
+    if playlist.size() > 0:
+        xbmc.Player().play(playlist)
+        xbmc.log(f"TubeArchivist: Started playlist with {playlist.size()} videos", xbmc.LOGINFO)
+    else:
+        xbmc.log("TubeArchivist: Playlist is empty, nothing to play", xbmc.LOGWARNING)
 
 def root_menu():
     items = [
@@ -248,12 +345,18 @@ def list_playlists(page=1):
 
     for pl in items:
         label = pl.get("playlist_name", "Unnamed Playlist")
+        pl_id = pl.get("playlist_id")
         # API returns playlist_thumbnail, not playlist_thumb_url
         thumb = ta.fix_url(pl.get("playlist_thumbnail") or pl.get("playlist_thumb_url"))
         li = xbmcgui.ListItem(label=label)
         if thumb:
             li.setArt({"thumb": thumb, "icon": thumb, "fanart": thumb})
-        url = build_url({"action": "list_playlist_videos", "id": pl.get("playlist_id")})
+
+        # Add context menu
+        if pl_id:
+            add_playlist_context_menu(li, pl_id)
+
+        url = build_url({"action": "list_playlist_videos", "id": pl_id})
         xbmcplugin.addDirectoryItem(HANDLE, url, li, isFolder=True)
 
     # Navigation - Next page button
@@ -330,8 +433,9 @@ def list_channel_videos(channel_id, page=1):
     xbmcplugin.setContent(HANDLE, "videos")
 
     # 4) Render items with context menu
-    for video in page_slice:
-        li, play_url = create_video_listitem(video)
+    list_id = f"channel:{channel_id}"
+    for i, video in enumerate(page_slice, start=start):
+        li, play_url = create_video_listitem(video, add_play_from_here=True, video_list_id=list_id, video_index=i)
         xbmcplugin.addDirectoryItem(HANDLE, play_url, li, isFolder=False)
 
     # Navigation - Next page button
@@ -432,8 +536,9 @@ def list_playlist_videos(playlist_id, page=1):
     xbmcplugin.setContent(HANDLE, "videos")
 
     # 4) Render items with context menu
-    for video in page_slice:
-        li, play_url = create_video_listitem(video)
+    list_id = f"playlist:{playlist_id}"
+    for i, video in enumerate(page_slice, start=start):
+        li, play_url = create_video_listitem(video, add_play_from_here=True, video_list_id=list_id, video_index=i)
         xbmcplugin.addDirectoryItem(HANDLE, play_url, li, isFolder=False)
 
     # Navigation - Next page button
@@ -853,6 +958,106 @@ def handle_play():
     except Exception as e:
         xbmc.log(f"TA play: failed to sync TA for {yid}: {e}", xbmc.LOGWARNING)
 
+def handle_play_all():
+    """Handle play_all action - fetch all videos from list and start playlist."""
+    list_id = params.get("list_id")
+    if not list_id:
+        xbmc.log("TubeArchivist: No list_id for play_all", xbmc.LOGWARNING)
+        return
+
+    xbmc.log(f"TubeArchivist: play_all for list {list_id}", xbmc.LOGINFO)
+
+    # Parse list_id (format: "channel:ID" or "playlist:ID")
+    parts = list_id.split(":", 1)
+    if len(parts) != 2:
+        xbmc.log(f"TubeArchivist: Invalid list_id format: {list_id}", xbmc.LOGERROR)
+        return
+
+    list_type, entity_id = parts
+
+    # Fetch all videos from the list
+    all_videos = []
+    cur = 1
+    while True:
+        if list_type == "channel":
+            data = ta.get(f"video/?channel={entity_id}&page={cur}")
+        elif list_type == "playlist":
+            data = ta.get(f"video/?playlist={entity_id}&page={cur}")
+        else:
+            xbmc.log(f"TubeArchivist: Unknown list_type: {list_type}", xbmc.LOGERROR)
+            return
+
+        vids = data.get("data", [])
+        if not vids:
+            break
+        all_videos.extend(vids)
+        paginate = data.get("paginate") or {}
+        last_page = int(paginate.get("last_page", cur))
+        if cur >= last_page:
+            break
+        cur += 1
+
+    # Sort locally
+    sort_choice = get_sort_order()
+    all_videos = _local_sort(all_videos, sort_choice)
+
+    # Play all videos
+    play_all_videos(all_videos, start_index=0)
+
+def handle_play_from_here():
+    """Handle play_from_here action - fetch all videos and start from specified index."""
+    list_id = params.get("list_id")
+    index = params.get("index")
+
+    if not list_id or index is None:
+        xbmc.log("TubeArchivist: Missing list_id or index for play_from_here", xbmc.LOGWARNING)
+        return
+
+    try:
+        start_index = int(index)
+    except ValueError:
+        xbmc.log(f"TubeArchivist: Invalid index: {index}", xbmc.LOGERROR)
+        return
+
+    xbmc.log(f"TubeArchivist: play_from_here for list {list_id}, index {start_index}", xbmc.LOGINFO)
+
+    # Parse list_id (format: "channel:ID" or "playlist:ID")
+    parts = list_id.split(":", 1)
+    if len(parts) != 2:
+        xbmc.log(f"TubeArchivist: Invalid list_id format: {list_id}", xbmc.LOGERROR)
+        return
+
+    list_type, entity_id = parts
+
+    # Fetch all videos from the list
+    all_videos = []
+    cur = 1
+    while True:
+        if list_type == "channel":
+            data = ta.get(f"video/?channel={entity_id}&page={cur}")
+        elif list_type == "playlist":
+            data = ta.get(f"video/?playlist={entity_id}&page={cur}")
+        else:
+            xbmc.log(f"TubeArchivist: Unknown list_type: {list_type}", xbmc.LOGERROR)
+            return
+
+        vids = data.get("data", [])
+        if not vids:
+            break
+        all_videos.extend(vids)
+        paginate = data.get("paginate") or {}
+        last_page = int(paginate.get("last_page", cur))
+        if cur >= last_page:
+            break
+        cur += 1
+
+    # Sort locally
+    sort_choice = get_sort_order()
+    all_videos = _local_sort(all_videos, sort_choice)
+
+    # Play from specified index
+    play_all_videos(all_videos, start_index=start_index)
+
 if __name__ == "__main__":
     params = dict(urllib.parse.parse_qsl(sys.argv[2][1:]))
     action = params.get("action")
@@ -879,6 +1084,10 @@ if __name__ == "__main__":
     elif action == "search":
         search_type = params.get("type", "all")
         search(int(params.get("page", "1")), search_type)
+    elif action == "play_all":
+        handle_play_all()
+    elif action == "play_from_here":
+        handle_play_from_here()
     elif action == "play":
         handle_play()
         sys.exit(0)
