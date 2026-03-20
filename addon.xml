@@ -1,6 +1,6 @@
 <addon id="plugin.video.tubearchivist"
        name="Tube Archivist"
-       version="0.2.0"
+       version="0.3.0"
        provider-name="Alistair Porter"
        type="xbmc.python.pluginsource">
     <requires>
