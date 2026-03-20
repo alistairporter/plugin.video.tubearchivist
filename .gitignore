@@ -215,4 +215,11 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# Kodi addon specific
+*.zip
+
+# exclude any directory staring with a .
 .*/
+
+# except forgejo actions
+!.forgejo

@@ -67,6 +67,34 @@ The addon communicates with TubeArchivist API endpoints:
 
 ## Development
 
+### Creating Releases
+
+Releases are automated via Forgejo Actions (`.forgejo/workflows/release.yml`). To create a new release:
+
+1. Bump the version in `addon.xml`:
+   ```xml
+   <addon id="plugin.video.tubearchivist"
+          name="Tube Archivist"
+          version="0.4.0"
+          ...>
+   ```
+
+2. Commit and push to `main`:
+   ```bash
+   git add addon.xml
+   git commit -m "Bump version to 0.4.0"
+   git push origin main
+   ```
+
+The workflow will automatically:
+- Detect the version change in `addon.xml`
+- Create a git tag `v0.4.0`
+- Package the addon as `plugin.video.tubearchivist-0.4.0.zip`
+- Generate a changelog from git commits since the last tag
+- Create a Forgejo release with the zip file attached
+
+The packaged zip excludes development files (`.git`, `.forgejo`, `__pycache__`, `*.yaml`, `DOCUMENTATION.md`) and is ready for installation.
+
 ### Testing the Addon
 
 Since this is a Kodi addon, testing requires a running Kodi instance
