@@ -25,6 +25,31 @@ def get_max_videos():
     """Get the max videos per page from settings."""
     return int(addon.getSetting("max_videos") or 50)
 
+def get_subtitle_urls(video_data):
+    """
+    Extract subtitle URLs from video data.
+
+    Args:
+        video_data: Video dict from Tube Archivist API
+
+    Returns:
+        list: List of absolute subtitle URLs
+    """
+    subtitles = video_data.get("subtitles", [])
+    if not subtitles:
+        return []
+
+    subtitle_urls = []
+    for sub in subtitles:
+        media_url = sub.get("media_url")
+        if media_url:
+            # Convert relative URL to absolute
+            absolute_url = ta.server_url + media_url
+            subtitle_urls.append(absolute_url)
+            xbmc.log(f"TubeArchivist: Found subtitle - lang: {sub.get('lang')}, source: {sub.get('source')}, url: {absolute_url}", xbmc.LOGDEBUG)
+
+    return subtitle_urls
+
 def add_channel_context_menu(li, channel_id):
     """
     Add context menu items for a channel.
@@ -166,6 +191,12 @@ def play_all_videos(videos, start_index=0):
             info = li.getVideoInfoTag()
             info.setTitle(title)
             info.setPlot(video.get("description", ""))
+
+            # Add subtitles if available
+            subtitle_urls = get_subtitle_urls(video_data)
+            if subtitle_urls:
+                li.setSubtitles(subtitle_urls)
+                xbmc.log(f"TubeArchivist: Added {len(subtitle_urls)} subtitle(s) to playlist video {yid}", xbmc.LOGDEBUG)
 
             playlist.add(media_url, li)
             xbmc.log(f"TubeArchivist: Added video {i}: {title}", xbmc.LOGDEBUG)
@@ -895,6 +926,12 @@ def handle_play():
     info = li.getVideoInfoTag()
     info.setTitle(video.get("title") or "")
     info.setPlot(video.get("description") or "")
+
+    # Add subtitles if available
+    subtitle_urls = get_subtitle_urls(video)
+    if subtitle_urls:
+        li.setSubtitles(subtitle_urls)
+        xbmc.log(f"TubeArchivist: Added {len(subtitle_urls)} subtitle(s) to video {yid}", xbmc.LOGINFO)
 
     xbmcplugin.setResolvedUrl(HANDLE, True, li)
 
