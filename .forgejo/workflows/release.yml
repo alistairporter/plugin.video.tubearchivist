@@ -9,81 +9,70 @@ on:
   workflow_dispatch:
 
 jobs:
-  release:
+  prepare:
     runs-on: docker
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+      should_release: ${{ steps.check.outputs.should_release }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 2  # Need previous commit to compare
 
-      - name: Extract version from addon.xml
-        id: get_version
+      - name: Check version and determine if release needed
+        id: check
         run: |
-          VERSION=$(grep -oP 'version="\K[^"]+' addon.xml)
+          # Extract version
+          VERSION=$(sed -n 's/.*version="\([^"]*\)".*/\1/p' addon.xml | head -1)
 
           if [ -z "$VERSION" ]; then
             echo "ERROR: Could not extract version from addon.xml"
             exit 1
           fi
 
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Detected version: $VERSION"
+          echo "Current version: $VERSION"
 
-      - name: Check if version changed
-        id: check_version
-        run: |
-          # If triggered by workflow_dispatch, always proceed
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-            echo "Manual trigger - proceeding with release"
+          # Always set version output
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+          # Check if tag already exists
+          if git ls-remote --tags origin | grep -q "refs/tags/v$VERSION$"; then
+            echo "Tag v$VERSION already exists, skipping release"
+            echo "should_release=false" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # Get version from previous commit
+          # If triggered by workflow_dispatch, always proceed
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual trigger - proceeding with release"
+            echo "should_release=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Check if version changed from previous commit
           git checkout HEAD~1 -- addon.xml 2>/dev/null || true
           if [ -f addon.xml ]; then
-            OLD_VERSION=$(grep -oP 'version="\K[^"]+' addon.xml)
+            OLD_VERSION=$(sed -n 's/.*version="\([^"]*\)".*/\1/p' addon.xml | head -1)
             git checkout HEAD -- addon.xml
           else
             OLD_VERSION=""
           fi
 
-          NEW_VERSION="${{ steps.get_version.outputs.version }}"
-          echo "Old version: $OLD_VERSION"
-          echo "New version: $NEW_VERSION"
+          echo "Previous version: $OLD_VERSION"
 
-          if [ "$OLD_VERSION" != "$NEW_VERSION" ]; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-            echo "Version changed from $OLD_VERSION to $NEW_VERSION"
+          if [ "$OLD_VERSION" != "$VERSION" ]; then
+            echo "Version changed from $OLD_VERSION to $VERSION"
+            echo "should_release=true" >> $GITHUB_OUTPUT
           else
-            echo "changed=false" >> $GITHUB_OUTPUT
             echo "Version unchanged, skipping release"
-          fi
-
-      - name: Check if tag exists
-        id: check_tag
-        if: steps.check_version.outputs.changed == 'true'
-        run: |
-          VERSION="${{ steps.get_version.outputs.version }}"
-          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-            echo "Tag v$VERSION already exists"
-          else
-            echo "exists=false" >> $GITHUB_OUTPUT
-            echo "Tag v$VERSION does not exist"
+            echo "should_release=false" >> $GITHUB_OUTPUT
           fi
 
       - name: Create git tag
-        if: steps.check_version.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
+        if: steps.check.outputs.should_release == 'true'
         run: |
-          VERSION="${{ steps.get_version.outputs.version }}"
-
-          # Validate VERSION is not empty
-          if [ -z "$VERSION" ]; then
-            echo "ERROR: VERSION is empty"
-            exit 1
-          fi
+          VERSION=$(sed -n 's/.*version="\([^"]*\)".*/\1/p' addon.xml | head -1)
 
           echo "Creating tag v$VERSION"
           git config user.name "Forgejo Actions"
@@ -91,17 +80,17 @@ jobs:
           git tag -a "v$VERSION" -m "Release version $VERSION"
           git push origin "v$VERSION"
 
-      - name: Package addon
-        if: steps.check_version.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
+      - name: Install zip utility
+        if: steps.check.outputs.should_release == 'true'
         run: |
-          VERSION="${{ steps.get_version.outputs.version }}"
-          ADDON_ID=$(grep -oP 'id="\K[^"]+' addon.xml)
+          apt-get update -qq
+          apt-get install -y -qq zip
 
-          # Validate inputs
-          if [ -z "$VERSION" ] || [ -z "$ADDON_ID" ]; then
-            echo "ERROR: VERSION or ADDON_ID is empty"
-            exit 1
-          fi
+      - name: Package addon
+        if: steps.check.outputs.should_release == 'true'
+        run: |
+          VERSION=$(sed -n 's/.*version="\([^"]*\)".*/\1/p' addon.xml | head -1)
+          ADDON_ID=$(sed -n 's/.*id="\([^"]*\)".*/\1/p' addon.xml | head -1)
 
           echo "Packaging $ADDON_ID version $VERSION"
 
@@ -128,10 +117,9 @@ jobs:
           echo "Created package: $ADDON_ID-$VERSION.zip"
 
       - name: Generate changelog
-        if: steps.check_version.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
-        id: changelog
+        if: steps.check.outputs.should_release == 'true'
         run: |
-          VERSION="${{ steps.get_version.outputs.version }}"
+          VERSION=$(sed -n 's/.*version="\([^"]*\)".*/\1/p' addon.xml | head -1)
 
           # Try to get commits since last tag
           LAST_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || echo "")
@@ -148,13 +136,52 @@ jobs:
 
           cat changelog.md
 
+      - name: Upload artifacts
+        if: steps.check.outputs.should_release == 'true'
+        uses: actions/upload-artifact@v3
+        with:
+          name: release-assets
+          path: |
+            *.zip
+            changelog.md
+
+  release:
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: docker
+    steps:
+      - name: Debug outputs
+        run: |
+          echo "should_release: ${{ needs.prepare.outputs.should_release }}"
+          echo "version: ${{ needs.prepare.outputs.version }}"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: release-assets
+
+      - name: List downloaded files
+        run: |
+          echo "Downloaded files:"
+          ls -la
+          echo ""
+          echo "Changelog contents:"
+          cat changelog.md
+
+      - name: Read changelog
+        id: changelog
+        run: |
+          CHANGELOG=$(cat changelog.md)
+          echo "changelog<<EOF" >> $GITHUB_OUTPUT
+          cat changelog.md >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
       - name: Create Release
-        if: steps.check_version.outputs.changed == 'true' && steps.check_tag.outputs.exists == 'false'
         uses: actions/forgejo-release@v2
         with:
           direction: upload
           token: ${{ secrets.GITHUB_TOKEN }}
           release-dir: ./
-          release-notes: ./changelog.md
-          tag: v${{ steps.get_version.outputs.version }}
-          title: Release v${{ steps.get_version.outputs.version }}
+          release-notes: ${{ steps.changelog.outputs.changelog }}
+          tag: v${{ needs.prepare.outputs.version }}
+          title: Release v${{ needs.prepare.outputs.version }}
