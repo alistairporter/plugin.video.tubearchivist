@@ -1,75 +1,69 @@
 # DOCUMENTATION.md
 
-This file gives a place to note down the structure and particulars of this project for future refernece.
+Notes on how this project is structured, for future reference (or when I inevitably forget how something works).
 
-## Project Overview
+## Structure
 
-This is a Kodi addon for browsing and playing content from a TubeArchivist server. TubeArchivist is a self-hosted YouTube backup and media server. The addon connects to the TubeArchivist API to browse channels, playlists, and videos, and plays them directly in Kodi.
+There are two main modules:
 
-## Architecture
+`default.py` - Entry point and all the UI stuff
+- Handles Kodi directory listings and navigation
+- Routes actions via URL query parameters (`action=whatever`)
+- Creates ListItems with video/channel/playlist metadata
+- Pagination (mostly client-side, more on that below)
+- Playback resolution and progress tracking
+- Context menus
 
-### Two-Module Structure
+`resources/lib/tubearchivist.py` - API client and helpers
+- `TubeArchivist` class for talking to the API
+- `TAPlaybackTracker` for monitoring playback and syncing progress back to the server
+- Auth via API token
+- URL handling (converts relative API URLs to absolute)
 
-The addon consists of two main Python modules:
+### Design _quirks_ (bodges)
 
-1. **`default.py`** - Main entry point and UI logic
-   - Handles all Kodi directory listings and navigation
-   - Implements action routing (`action` parameter in URL queries)
-   - Creates ListItems with metadata for videos, channels, and playlists
-   - Manages pagination (client-side and server-side)
-   - Handles playback resolution and progress tracking
-   - Context menus for channels, playlists, and videos
+Client-side sorting/pagination: Fetch all the pages from the API and then sort + paginate locally. Why? Because TubeArchivist's server-side sorting doesn't work right when you filter by channel or playlist. So we just pull everything and handle it ourselves.
 
-2. **`resources/lib/tubearchivist.py`** - API client and server protocol utilities
-   - `TubeArchivist` class: HTTP client for TubeArchivist API
-   - `TAPlaybackTracker` class: Monitors playback and syncs progress/watched status to server
-   - Handles authentication via API token
-   - Converts relative server URLs to absolute URLs
+Action routing: URL params determine what happens:
+- `action=list_channels` → show channels
+- `action=list_channel_videos&id=CHANNEL_ID&page=1` → videos for a channel
+- `action=play&yid=VIDEO_ID` → play a video
+- `action=play_all&list_id=channel:ID` → play all videos from a channel/playlist
+- `action=play_from_here&list_id=channel:ID&index=5` → start playing from a specific video
 
-### Addon Design
+Playback metadata: `_apply_playback_meta()` deals with watched status and resume points. It tries to use `InfoTagVideo.setResumePoint()` for Kodi Omega and newer, but falls back to the old properties for Matrix/Nexus.
 
-**Client-Side Sorting and Pagination**: The addon fetches all pages from the TubeArchivist API for many views (channels, playlists, videos in a channel/playlist) and then sorts and paginates locally. This is because the TubeArchivist API's server-side sorting is unreliable for filtered queries (e.g., `?channel=ID` or `?playlist=ID`).
+Progress tracking: `TAPlaybackTracker` polls every 2 seconds during playback and syncs when you're done. If you watched 90%+ or there's less than 60s left, it marks the video as watched. Otherwise it just saves your position.
 
-**Action-Based Routing**: The addon uses URL query parameters to route actions:
-- `action=list_channels` → Show all channels
-- `action=list_channel_videos&id=CHANNEL_ID&page=1` → Show videos for a channel
-- `action=play&yid=VIDEO_ID` → Play a video
-- `action=play_all&list_id=channel:ID` → Play all videos from a channel/playlist
-- `action=play_from_here&list_id=channel:ID&index=5` → Play from a specific video in a list
+Subtitles: If TubeArchivist has subtitles, we load them automatically. `get_subtitle_urls()` pulls them from the video data and fixes up the URLs. Works in both single video playback and playlists.
 
-**Playback Metadata**: The `_apply_playback_meta()` function handles watched status and resume points across Kodi versions (Matrix/Nexus/Omega). It prefers `InfoTagVideo.setResumePoint()` for Omega+ but falls back to legacy properties for older versions.
+### API stuff
 
-**Progress Tracking**: The `TAPlaybackTracker` class (in `tubearchivist.py`) polls playback state every 2 seconds and syncs to the server when playback ends. If 90%+ watched or <60s remaining, it marks as watched; otherwise, it saves the resume position.
+used endpoints:
+- `/api/video/` - list/search videos
+- `/api/video/{youtube_id}/` - get video details and media URL
+- `/api/video/{youtube_id}/progress/` - update playback position (POST)
+- `/api/channel/` - list channels
+- `/api/playlist/` - list playlists
+- `/api/watched/` - mark watched/unwatched (POST)
+- `/api/search/?query=QUERY` - search everything
 
-**Subtitle Support**: The addon automatically loads subtitles from TubeArchivist when available. The `get_subtitle_urls()` helper function extracts subtitle URLs from video data and converts them to absolute URLs. Subtitles are added using `li.setSubtitles()` in both single video playback (`handle_play()`) and playlist playback (`play_all_videos()`).
+Auth: Every request needs `Authorization: Token {api_token}` in the headers.
 
-### TubeArchivist API Integration
+URL handling: The API returns relative URLs like `/media/videos/...`, so `fix_url()` turns them into absolute URLs by inserting the server URL at the start.
 
-The addon communicates with TubeArchivist API endpoints:
-- `/api/video/` - List and search videos
-- `/api/video/{youtube_id}/` - Get video details and media URL
-- `/api/video/{youtube_id}/progress/` - Update playback position (POST)
-- `/api/channel/` - List channels
-- `/api/playlist/` - List playlists
-- `/api/watched/` - Mark videos as watched/unwatched (POST)
-- `/api/search/?query=QUERY` - Search all content types
+Subtitles: The API includes a `subtitles` array for each video (check `Tube Archivist API.yaml` for the schema). Each entry has:
+- `lang` - language code
+- `media_url` - path to subtitle file
+- `ext` - file extension (vtt, srt, etc.)
+- `source` - "auto" or "user"
+- `name` - display name
 
-**Authentication**: All API requests include `Authorization: Token {api_token}` header.
+## Development stuff
 
-**URL Handling**: The TubeArchivist API returns relative URLs (e.g., `/media/videos/...`). The `fix_url()` method converts these to absolute URLs by prepending the server URL.
+### Releases
 
-**Subtitles**: The API returns subtitle information in the `subtitles` array for each video (see `SubtitleItem` schema in `Tube Archivist API.yaml`). Each subtitle has:
-- `lang` - Language code
-- `media_url` - Path to subtitle file on server
-- `ext` - File extension (vtt, srt, etc.)
-- `source` - Either "auto" (auto-generated) or "user" (manually uploaded)
-- `name` - Display name
-
-## Development
-
-### Creating Releases
-
-Releases are automated via Forgejo Actions (`.forgejo/workflows/release.yml`). To create a new release:
+Handled by Forgejo Actions (`.forgejo/workflows/release.yml`). Just:
 
 1. Bump the version in `addon.xml`:
    ```xml
@@ -79,67 +73,61 @@ Releases are automated via Forgejo Actions (`.forgejo/workflows/release.yml`). T
           ...>
    ```
 
-2. Commit and push to `main`:
+2. Commit and push:
    ```bash
    git add addon.xml
    git commit -m "Bump version to 0.4.0"
    git push origin main
    ```
 
-The workflow will automatically:
-- Detect the version change in `addon.xml`
-- Create a git tag `v0.4.0`
-- Package the addon as `plugin.video.tubearchivist-0.4.0.zip`
-- Generate a changelog from git commits since the last tag
-- Create a Forgejo release with the zip file attached
+The workflow does the rest:
+- Tags the commit as `v0.4.0`
+- Packages everything as `plugin.video.tubearchivist-0.4.0.zip`
+- Generates a changelog from commits since last tag
+- Creates a Forgejo release with the zip
 
-The packaged zip excludes development files (`.git`, `.forgejo`, `__pycache__`, `*.yaml`, `DOCUMENTATION.md`) and is ready for installation.
+The zip excludes dev files (`.git`, `.forgejo`, `__pycache__`, `*.yaml`, `DOCUMENTATION.md`) so it's ready to install.
 
-### Testing the Addon
+### Testing
 
-Since this is a Kodi addon, testing requires a running Kodi instance
-This can be provided with `nix run "nixpkgs#kodi"` if nix is available or using flatpak or the system package manager if not.
+You need Kodi running. Get it with `nix run "nixpkgs#kodi"` if you have nix, otherwise use flatpak or your package manager.
 
-Once that is satisfied:
+Then:
 
-1. Ensure Kodi can access this directory (either install it i.e: zip repo and install or symlink to Kodi's addons directory: usually at `~/.kodi/addons`)
-2. Configure the addon settings in Kodi:
-   - Server URL (default: `http://localhost:8000`)
-   - API Token (get from TubeArchivist settings)
-3. Check Kodi logs for debugging: `~/.kodi/temp/kodi.log` (Linux) or equivalent
-4. Look for log entries prefixed with `TubeArchivist:` or `TA `
+1. Install the addon - either zip it up and install through Kodi, or clone into `~/.kodi/addons`
+2. Configure settings in Kodi:
+   - Server URL (defaults to `http://localhost:8000`)
+   - API Token (grab from TubeArchivist settings)
+3. Check logs at `~/.kodi/temp/kodi.log` (Linux)
+4. Look for lines starting with `TubeArchivist:` or `TA `
 
-### Adding New Features
+### Adding features
 
-**Adding a new action**:
-1. Add a new `elif` clause in the `if __name__ == "__main__"` block at the bottom of `default.py`
-2. Create a corresponding function (e.g., `def handle_my_action():`)
-3. Use `build_url()` to create URLs for the new action
-4. Add to context menus if needed (see `add_*_context_menu()` functions)
+New action:
+1. Add an `elif` clause to the `if __name__ == "__main__"` block at the bottom of `default.py`
+2. Write the handler function (like `def handle_my_action():`)
+3. Use `build_url()` to make URLs for it
+4. If you need it in context menus, check out the `add_*_context_menu()` functions
 
-**Adding API methods**:
-1. Add methods to the `TubeArchivist` class in `resources/lib/tubearchivist.py`
-2. Use `self.get()` for GET requests or `self.post()` for POST requests
-3. Reference `Tube Archivist API.yaml` for endpoint details and schemas
+New API method:
+1. Add it to the `TubeArchivist` class in `resources/lib/tubearchivist.py`
+2. Use `self.get()` for GETs, `self.post()` for POSTs
+3. Check `Tube Archivist API.yaml` for endpoint docs
 
-**Video metadata**: Use `create_video_listitem()` function which handles all video metadata, thumbnails, context menus, and playback metadata in one place.
+Video metadata: Just use `create_video_listitem()` - it handles metadata, thumbnails, context menus, and playback stuff all in one shot.
 
 ### Settings
 
-User-configurable settings are defined in `resources/settings.xml`:
-- `server_url` - TubeArchivist server URL
-- `api_token` - API authentication token
-- `sort_order` - Video sort preference (newest first, oldest first, A-Z, Z-A)
-- `max_videos` - Videos per page (10-500, default 50)
+Defined in `resources/settings.xml`:
+- `server_url` - where your TubeArchivist server is
+- `api_token` - auth token
+- `sort_order` - how to sort videos (newest, oldest, A-Z, Z-A)
+- `max_videos` - videos per page (10-500, defaults to 50)
 
-Access settings in code: `addon.getSetting("setting_id")`
+Get them in code with `addon.getSetting("setting_id")`
 
-## API Documentation
+## API docs
 
-The TubeArchivist api is available on a running instance at `/api/docs` with a schema at `/api/schema`
+TubeArchivist exposes API docs at `/api/docs` with the schema at `/api/schema` on your running instance.
 
-A copy of this schema is in `Tube Archivist API.yaml` (OpenAPI 3.0). Refer to this file for:
-- Available endpoints and parameters
-- Request/response schemas
-- Authentication requirements
-- Pagination structure
+There's a copy of the schema in `Tube Archivist API.yaml` (OpenAPI 3.0) - use it to check endpoints, request/response formats, auth, and pagination.
