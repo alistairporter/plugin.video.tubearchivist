@@ -1,6 +1,8 @@
 import sys
 import math
 import urllib.parse
+from datetime import datetime, timezone
+from typing import Optional, Dict, List, Tuple
 
 import xbmc
 import xbmcaddon
@@ -8,6 +10,18 @@ import xbmcgui
 import xbmcplugin
 
 from resources.lib.tubearchivist import TubeArchivist
+
+# Constants
+MAX_API_PAGES = 100  # Prevent infinite loops on malformed API responses
+WATCHED_THRESHOLD_PERCENT = 95
+FINISHED_THRESHOLD_PERCENT = 90
+FINISHED_REMAINING_SECONDS = 60
+MIN_PROGRESS_SECONDS = 5
+PLAYBACK_START_TIMEOUT_MS = 15000
+PLAYBACK_POLL_INTERVAL_MS = 1000
+SEEK_STABILIZATION_MS = 1000
+SEEK_VERIFICATION_ATTEMPTS = 20
+SEEK_TOLERANCE_SECONDS = 5
 
 # Global instances
 addon = xbmcaddon.Addon()
@@ -17,15 +31,58 @@ ta = TubeArchivist()
 # Get the plugin base URL
 PLUGIN_URL = sys.argv[0]
 
-def build_url(query):
+def build_url(query: Dict[str, str]) -> str:
     """Build a plugin URL from a query dict."""
     return sys.argv[0] + "?" + urllib.parse.urlencode(query)
 
-def get_max_videos():
+def fetch_all_pages(endpoint: str, **params) -> List[Dict]:
+    """
+    Fetch all pages from a paginated TubeArchivist endpoint.
+
+    Args:
+        endpoint: API endpoint (e.g., "video/?channel=...")
+        **params: Additional query parameters
+
+    Returns:
+        List of all items across all pages
+
+    Raises:
+        RuntimeError: If MAX_API_PAGES is exceeded (likely API issue)
+    """
+    all_items = []
+    cur = 1
+
+    while cur <= MAX_API_PAGES:
+        try:
+            data = ta.get(f"{endpoint}&page={cur}" if "?" in endpoint else f"{endpoint}?page={cur}")
+            items = data.get("data", [])
+
+            if not items:
+                break
+
+            all_items.extend(items)
+
+            paginate = data.get("paginate") or {}
+            last_page = int(paginate.get("last_page", cur))
+
+            if cur >= last_page:
+                break
+
+            cur += 1
+        except Exception as e:
+            xbmc.log(f"TubeArchivist: Error fetching page {cur}: {e}", xbmc.LOGERROR)
+            break
+
+    if cur > MAX_API_PAGES:
+        xbmc.log(f"TubeArchivist: Exceeded MAX_API_PAGES ({MAX_API_PAGES}), possible API issue", xbmc.LOGWARNING)
+
+    return all_items
+
+def get_max_videos() -> int:
     """Get the max videos per page from settings."""
     return int(addon.getSetting("max_videos") or 50)
 
-def get_subtitle_urls(video_data):
+def get_subtitle_urls(video_data: Dict) -> List[str]:
     """
     Extract subtitle URLs from video data.
 
@@ -33,7 +90,7 @@ def get_subtitle_urls(video_data):
         video_data: Video dict from Tube Archivist API
 
     Returns:
-        list: List of absolute subtitle URLs
+        List of absolute subtitle URLs
     """
     subtitles = video_data.get("subtitles", [])
     if not subtitles:
@@ -50,7 +107,7 @@ def get_subtitle_urls(video_data):
 
     return subtitle_urls
 
-def add_channel_context_menu(li, channel_id):
+def add_channel_context_menu(li: xbmcgui.ListItem, channel_id: str) -> None:
     """
     Add context menu items for a channel.
 
@@ -70,7 +127,7 @@ def add_channel_context_menu(li, channel_id):
 
     li.addContextMenuItems(context_menu)
 
-def add_playlist_context_menu(li, playlist_id):
+def add_playlist_context_menu(li: xbmcgui.ListItem, playlist_id: str) -> None:
     """
     Add context menu items for a playlist.
 
@@ -120,8 +177,8 @@ def create_video_listitem(video, add_play_from_here=False, video_list_id=None, v
     title = video.get("title", "Untitled")
     desc = video.get("description", "")
     thumb = ta.server_url + (video.get("vid_thumb_url") or "")
-    yid = video.get('youtube_id')
-    play_url = build_url({"action": "play", "yid": yid})
+    video_id = video.get('youtube_id')
+    play_url = build_url({"action": "play", "video_id": video_id})
     ch_id = video.get("channel", {}).get("channel_id") if isinstance(video.get("channel"), dict) else None
 
     li = xbmcgui.ListItem(label=title)
@@ -146,7 +203,7 @@ def create_video_listitem(video, add_play_from_here=False, video_list_id=None, v
 
     return li, play_url
 
-def play_all_videos(videos, start_index=0):
+def play_all_videos(videos: List[Dict], start_index: int = 0) -> None:
     """
     Create a Kodi playlist from videos and start playing.
 
@@ -164,22 +221,38 @@ def play_all_videos(videos, start_index=0):
 
     xbmc.log(f"TubeArchivist: Creating playlist with {len(videos)} videos, starting at {start_index}", xbmc.LOGINFO)
 
-    # Add all videos to playlist starting from start_index
+    # Collect all video IDs that need detailed info
+    videos_needing_fetch = []
     for i, video in enumerate(videos[start_index:], start=start_index):
-        yid = video.get('youtube_id')
-        if not yid:
+        video_id = video.get('youtube_id')
+        if video_id and not video.get("media_url"):
+            videos_needing_fetch.append((i, video_id))
+
+    # Batch fetch if needed (currently TA API doesn't support batch, so we minimize)
+    # For now, we'll fetch only when needed
+    for i, video in enumerate(videos[start_index:], start=start_index):
+        video_id = video.get('youtube_id')
+        if not video_id:
             continue
 
-        # Fetch the video to get the media URL
         try:
-            data = ta.get(f"video/{yid}/")
-            video_data = (data.get("data") or data) if isinstance(data, dict) else {}
-            media_url = ta.server_url + (video_data.get("media_url") or "")
+            # Check if we already have media_url (from detailed video listing)
+            media_url_path = video.get("media_url")
 
-            if not video_data.get("media_url"):
-                xbmc.log(f"TubeArchivist: No media_url for video {yid}", xbmc.LOGWARNING)
+            if not media_url_path:
+                # Need to fetch full video details
+                data = ta.get(f"video/{video_id}/")
+                video_data = (data.get("data") or data) if isinstance(data, dict) else {}
+                media_url_path = video_data.get("media_url")
+            else:
+                # Use cached data
+                video_data = video
+
+            if not media_url_path:
+                xbmc.log(f"TubeArchivist: No media_url for video {video_id}", xbmc.LOGWARNING)
                 continue
 
+            media_url = ta.server_url + media_url_path
             title = video.get("title", "Untitled")
             thumb = ta.server_url + (video.get("vid_thumb_url") or "")
 
@@ -196,13 +269,13 @@ def play_all_videos(videos, start_index=0):
             subtitle_urls = get_subtitle_urls(video_data)
             if subtitle_urls:
                 li.setSubtitles(subtitle_urls)
-                xbmc.log(f"TubeArchivist: Added {len(subtitle_urls)} subtitle(s) to playlist video {yid}", xbmc.LOGDEBUG)
+                xbmc.log(f"TubeArchivist: Added {len(subtitle_urls)} subtitle(s) to playlist video {video_id}", xbmc.LOGDEBUG)
 
             playlist.add(media_url, li)
             xbmc.log(f"TubeArchivist: Added video {i}: {title}", xbmc.LOGDEBUG)
 
         except Exception as e:
-            xbmc.log(f"TubeArchivist: Failed to add video {yid} to playlist: {e}", xbmc.LOGWARNING)
+            xbmc.log(f"TubeArchivist: Failed to add video {video_id} to playlist: {e}", xbmc.LOGWARNING)
 
     # Start playing the playlist
     if playlist.size() > 0:
@@ -225,7 +298,7 @@ def root_menu():
         xbmcplugin.addDirectoryItem(HANDLE, url, li, isFolder=True)
     xbmcplugin.endOfDirectory(HANDLE)
 
-def get_sort_order():
+def get_sort_order() -> str:
     """Return the current sort order string for Tube Archivist API"""
     try:
         choice = int(addon.getSetting("sort_order") or 0)
@@ -240,7 +313,7 @@ def get_sort_order():
     }
     return mapping.get(choice, "-published")
 
-def _apply_playback_meta(li, v):
+def _apply_playback_meta(li: xbmcgui.ListItem, v: Dict) -> None:
     """
     Sets watched tick and progress, working on Matrix/Nexus/Omega.
     - Prefers InfoTagVideo.setResumePoint (Omega+), falls back to properties.
@@ -281,7 +354,7 @@ def _apply_playback_meta(li, v):
 
     # Watched?
     watched = bool(p.get("watched") or v.get("watched"))
-    if not watched and (percent is not None and percent >= 95):
+    if not watched and (percent is not None and percent >= WATCHED_THRESHOLD_PERCENT):
         watched = True
 
     # Apply playcount (the watched tick)
@@ -291,10 +364,9 @@ def _apply_playback_meta(li, v):
     wd = p.get("watched_date")
     if isinstance(wd, (int, float)) and wd > 0:
         try:
-            import datetime as _dt
-            info.setLastPlayed(_dt.datetime.utcfromtimestamp(int(wd)).strftime("%Y-%m-%d %H:%M:%S"))
-        except Exception:
-            pass
+            info.setLastPlayed(datetime.fromtimestamp(int(wd), timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
+        except Exception as e:
+            xbmc.log(f"TubeArchivist: Failed to set last played date: {e}", xbmc.LOGDEBUG)
 
     # Apply resume/progress
     # If watched, clear resume so Kodi shows the tick instead of a resume bar
@@ -321,21 +393,9 @@ def _apply_playback_meta(li, v):
             li.setProperty("ResumeTime", str(int(resume)))
             
 def list_channels():
-    all_channels = []
-    cur = 1
-
-    # Pull every page from /api/channel/
-    while True:
-        data = ta.get(f"channel/?page={cur}")
-        items = data.get("data", [])
-        if not items:
-            break
-        all_channels.extend(items)
-        paginate = data.get("paginate") or {}
-        last_page = int(paginate.get("last_page", cur))
-        if cur >= last_page:
-            break
-        cur += 1
+    """List all channels sorted alphabetically."""
+    # Fetch all channel pages
+    all_channels = fetch_all_pages("channel/")
 
     # Sort channels A→Z by name (case-insensitive)
     all_channels.sort(key=lambda c: (c.get("channel_name") or "").lower())
@@ -420,7 +480,7 @@ def _local_sort(videos, sort_choice):
         return videos
 
 
-def list_channel_videos(channel_id, page=1):
+def list_channel_videos(channel_id: str, page: int = 1):
     """
     List videos for a channel with client-side sorting and pagination.
 
@@ -428,22 +488,16 @@ def list_channel_videos(channel_id, page=1):
         channel_id: The channel ID
         page: Page number to display
     """
+    if not channel_id:
+        xbmc.log("TubeArchivist: channel_id is required for list_channel_videos", xbmc.LOGERROR)
+        xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
+        return
+
     sort_choice = get_sort_order()
     max_per_page = get_max_videos()
 
     # 1) Pull ALL pages from TA for this channel (server-side sort is unreliable here)
-    all_videos, cur = [], 1
-    while True:
-        data = ta.get(f"video/?channel={channel_id}&page={cur}")
-        vids = data.get("data", [])
-        if not vids:
-            break
-        all_videos.extend(vids)
-        paginate = data.get("paginate") or {}
-        last_page = int(paginate.get("last_page", cur))
-        if cur >= last_page:
-            break
-        cur += 1
+    all_videos = fetch_all_pages(f"video/?channel={channel_id}")
 
     # 2) Sort locally
     all_videos = _local_sort(all_videos, sort_choice)
@@ -483,23 +537,15 @@ def list_channel_videos(channel_id, page=1):
 
 
 
-def list_channel_playlists(channel_id):
+def list_channel_playlists(channel_id: str):
     """List all playlists for a specific channel."""
-    # Fetch all playlists and filter by channel
-    all_playlists = []
-    cur = 1
+    if not channel_id:
+        xbmc.log("TubeArchivist: channel_id is required for list_channel_playlists", xbmc.LOGERROR)
+        xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
+        return
 
-    while True:
-        data = ta.get(f"playlist/?page={cur}")
-        items = data.get("data", [])
-        if not items:
-            break
-        all_playlists.extend(items)
-        paginate = data.get("paginate") or {}
-        last_page = int(paginate.get("last_page", cur))
-        if cur >= last_page:
-            break
-        cur += 1
+    # Fetch all playlists and filter by channel
+    all_playlists = fetch_all_pages("playlist/")
 
     # Filter playlists that belong to this channel
     channel_playlists = [
@@ -523,7 +569,7 @@ def list_channel_playlists(channel_id):
 
     xbmcplugin.endOfDirectory(HANDLE)
 
-def list_playlist_videos(playlist_id, page=1):
+def list_playlist_videos(playlist_id: str, page: int = 1):
     """
     List videos for a playlist with client-side sorting and pagination.
 
@@ -531,22 +577,16 @@ def list_playlist_videos(playlist_id, page=1):
         playlist_id: The playlist ID
         page: Page number to display
     """
+    if not playlist_id:
+        xbmc.log("TubeArchivist: playlist_id is required for list_playlist_videos", xbmc.LOGERROR)
+        xbmcplugin.endOfDirectory(HANDLE, succeeded=False)
+        return
+
     sort_choice = get_sort_order()
     max_per_page = get_max_videos()
 
     # 1) Pull ALL pages from TA for this playlist
-    all_videos, cur = [], 1
-    while True:
-        data = ta.get(f"video/?playlist={playlist_id}&page={cur}")
-        vids = data.get("data", [])
-        if not vids:
-            break
-        all_videos.extend(vids)
-        paginate = data.get("paginate") or {}
-        last_page = int(paginate.get("last_page", cur))
-        if cur >= last_page:
-            break
-        cur += 1
+    all_videos = fetch_all_pages(f"video/?playlist={playlist_id}")
 
     # 2) Sort locally
     all_videos = _local_sort(all_videos, sort_choice)
@@ -584,7 +624,7 @@ def list_playlist_videos(playlist_id, page=1):
 
     xbmcplugin.endOfDirectory(HANDLE, cacheToDisc=False)
 
-def list_partial_videos(page=1):
+def list_partial_videos(page: int = 1):
     """
     List in-progress videos with client-side sorting and pagination.
 
@@ -595,18 +635,7 @@ def list_partial_videos(page=1):
     max_per_page = get_max_videos()
 
     # 1) Pull ALL pages from TA
-    all_videos, cur = [], 1
-    while True:
-        data = ta.get(f"video/?watch=continue&page={cur}")
-        vids = data.get("data", [])
-        if not vids:
-            break
-        all_videos.extend(vids)
-        paginate = data.get("paginate") or {}
-        last_page = int(paginate.get("last_page", cur))
-        if cur >= last_page:
-            break
-        cur += 1
+    all_videos = fetch_all_pages("video/?watch=continue")
 
     # 2) Sort locally
     all_videos = _local_sort(all_videos, sort_choice)
@@ -642,7 +671,7 @@ def list_partial_videos(page=1):
 
     xbmcplugin.endOfDirectory(HANDLE, cacheToDisc=False)
 
-def list_videos(page=1):
+def list_videos(page: int = 1):
     """
     List recent videos with client-side sorting and pagination.
 
@@ -655,18 +684,7 @@ def list_videos(page=1):
     xbmcplugin.setContent(HANDLE, "videos")
 
     # 1) Pull ALL pages from TA
-    all_videos, cur = [], 1
-    while True:
-        data = ta.get(f"video/?page={cur}")
-        vids = data.get("data", [])
-        if not vids:
-            break
-        all_videos.extend(vids)
-        paginate = data.get("paginate") or {}
-        last_page = int(paginate.get("last_page", cur))
-        if cur >= last_page:
-            break
-        cur += 1
+    all_videos = fetch_all_pages("video/")
 
     # 2) Sort locally
     all_videos = _local_sort(all_videos, sort_choice)
@@ -689,7 +707,7 @@ def list_videos(page=1):
         title = video.get("title", "Untitled")
         desc  = video.get("description", "")
         thumb = ta.server_url + (video.get("vid_thumb_url") or "")
-        play = f"{sys.argv[0]}?action=play&yid={video.get('youtube_id')}"
+        play = f"{sys.argv[0]}?action=play&video_id={video.get('youtube_id')}"
         ch_id = video.get("channel", {}).get("channel_id") if isinstance(video.get("channel"), dict) else None
 
         li   = xbmcgui.ListItem(label=title)
@@ -885,14 +903,14 @@ def search(page=1, search_type="all"):
     xbmcplugin.endOfDirectory(HANDLE, cacheToDisc=False)
 
 # ---------- TA scrobble helpers ----------
-def _ta_mark_progress(video_id: str, position: int):
+def _ta_mark_progress(video_id: str, position: int) -> None:
     """POST /api/video/{video_id}/progress/  ->  {"position": <seconds>}"""
     try:
         ta.post(f"video/{video_id}/progress/", {"position": int(position)})
     except Exception as e:
         xbmc.log(f"TA progress update failed for {video_id}: {e}", xbmc.LOGWARNING)
 
-def _ta_mark_watched(video_id: str, is_watched: bool = True):
+def _ta_mark_watched(video_id: str, is_watched: bool = True) -> None:
     """POST /api/watched/  ->  {"id": <video_id>, "is_watched": true|false}"""
     try:
         ta.post("watched/", {"id": video_id, "is_watched": bool(is_watched)})
@@ -901,7 +919,7 @@ def _ta_mark_watched(video_id: str, is_watched: bool = True):
 # ----------------------------------------
 
 # ---------- SponsorBlock helpers ----------
-def _get_sponsorblock_settings():
+def _get_sponsorblock_settings() -> Optional[Dict]:
     """Read SponsorBlock settings from addon configuration."""
     if not addon.getSettingBool("sponsorblock_enabled"):
         return None
@@ -925,7 +943,7 @@ def _get_sponsorblock_settings():
         "categories": categories,
     }
 
-def _filter_sponsorblock_segments(video_data, settings):
+def _filter_sponsorblock_segments(video_data: Dict, settings: Optional[Dict]) -> List[Dict]:
     """Extract and filter SponsorBlock segments based on user settings."""
     if not settings or not settings.get("enabled"):
         return []
@@ -964,12 +982,22 @@ def _filter_sponsorblock_segments(video_data, settings):
 
     return filtered
 
-def _check_segment_skip(player, segments, segment_state):
+def _check_segment_skip(
+    player: xbmc.Player,
+    segments: List[Dict],
+    segment_state: Dict
+) -> Tuple[Optional[Dict], Dict]:
     """
     Check if current position is in a segment that needs action.
     Based on the approach from script.service.sponsorblock by siku2.
 
-    Returns: (segment_to_handle, new_segment_state) or (None, segment_state)
+    Args:
+        player: Kodi player instance
+        segments: List of SponsorBlock segments
+        segment_state: State tracking dict
+
+    Returns:
+        Tuple of (segment_to_handle or None, new_segment_state)
 
     segment_state dict contains:
     - last_pos: last known position (to detect forward progress)
@@ -1028,7 +1056,7 @@ def _check_segment_skip(player, segments, segment_state):
     # Not in any segment
     return None, new_state
 
-def _show_sponsorblock_notification(category, action):
+def _show_sponsorblock_notification(category: str, action: str) -> None:
     """Show a toast notification for skipped/muted segment."""
     category_names = {
         "sponsor": "Sponsor",
@@ -1053,18 +1081,36 @@ def _show_sponsorblock_notification(category, action):
 # ----------------------------------------
 
 
-def handle_play():
-    yid = params.get("yid")
-    if not yid:
+def handle_play() -> None:
+    """Handle video playback with progress tracking and SponsorBlock integration."""
+    video_id = params.get("video_id")
+    if not video_id:
+        xbmc.log("TubeArchivist: video_id is required for playback", xbmc.LOGERROR)
         return
 
     # 1) Fetch fresh video object (so media_url is up to date)
     try:
-        data  = ta.get(f"video/{yid}/")
+        data = ta.get(f"video/{video_id}/")
         video = (data.get("data") or data) if isinstance(data, dict) else {}
+
+        if not video:
+            xbmc.log(f"TA play: No video data returned for {video_id}", xbmc.LOGERROR)
+            xbmcgui.Dialog().notification(
+                "TubeArchivist",
+                "Failed to load video",
+                xbmcgui.NOTIFICATION_ERROR,
+                5000
+            )
+            return
     except Exception as e:
-        xbmc.log(f"TA play: failed to fetch video {yid}: {e}", xbmc.LOGWARNING)
-        video = {}
+        xbmc.log(f"TA play: failed to fetch video {video_id}: {e}", xbmc.LOGERROR)
+        xbmcgui.Dialog().notification(
+            "TubeArchivist",
+            f"Network error: {e}",
+            xbmcgui.NOTIFICATION_ERROR,
+            5000
+        )
+        return
 
     media_url = ta.server_url + (video.get("media_url") or "")
     thumb     = ta.server_url + (video.get("vid_thumb_url") or "")
@@ -1083,7 +1129,7 @@ def handle_play():
     subtitle_urls = get_subtitle_urls(video)
     if subtitle_urls:
         li.setSubtitles(subtitle_urls)
-        xbmc.log(f"TubeArchivist: Added {len(subtitle_urls)} subtitle(s) to video {yid}", xbmc.LOGINFO)
+        xbmc.log(f"TubeArchivist: Added {len(subtitle_urls)} subtitle(s) to video {video_id}", xbmc.LOGINFO)
 
     xbmcplugin.setResolvedUrl(HANDLE, True, li)
 
@@ -1102,9 +1148,10 @@ def handle_play():
     player  = xbmc.Player()
     monitor = xbmc.Monitor()
 
-    # Wait up to ~15s for playback to actually start
+    # Wait for playback to actually start
     started = False
-    for _ in range(150):
+    max_attempts = PLAYBACK_START_TIMEOUT_MS // 100
+    for _ in range(max_attempts):
         if monitor.abortRequested():
             return
         if player.isPlayingVideo():
@@ -1179,18 +1226,18 @@ def handle_play():
 
                                 # Wait for seek to complete before continuing monitoring
                                 # Give Kodi time to process the seek and stabilize the stream
-                                xbmc.sleep(1000)  # Increased to 1 second
+                                xbmc.sleep(SEEK_STABILIZATION_MS)
 
                                 # Wait until player reports a position close to where we seeked
                                 # This ensures the seek actually completed
-                                for _ in range(20):  # Try for up to 2 more seconds
+                                for _ in range(SEEK_VERIFICATION_ATTEMPTS):
                                     try:
                                         current = player.getTime()
-                                        if abs(current - skip_to) < 5:  # Within 5 seconds of target
+                                        if abs(current - skip_to) < SEEK_TOLERANCE_SECONDS:
                                             xbmc.log(f"TA SponsorBlock: Seek completed, now at {current:.1f}s", xbmc.LOGINFO)
                                             break
-                                    except:
-                                        pass
+                                    except Exception as e:
+                                        xbmc.log(f"TA SponsorBlock: Error verifying seek: {e}", xbmc.LOGDEBUG)
                                     xbmc.sleep(100)
 
                                 xbmc.log(f"TA SponsorBlock: Skip completed. Will not skip this segment again.", xbmc.LOGINFO)
@@ -1208,33 +1255,33 @@ def handle_play():
 
         except Exception as e:
             xbmc.log(f"TA play: error during playback monitoring: {e}", xbmc.LOGDEBUG)
-        xbmc.sleep(1000)
+        xbmc.sleep(PLAYBACK_POLL_INTERVAL_MS)
 
     # 5) Decide what to send to TubeArchivist using cached values
     pos = int(last_pos or 0)
     dur = int(last_dur or 0)
 
-    # Consider “finished” if >=90% watched or <=60s remaining
+    # Consider "finished" if threshold is met
     finished = False
     if dur > 0:
         remaining = max(0, dur - pos)
-        finished = (pos >= int(0.90 * dur)) or (remaining <= 60)
+        finished = (pos >= int(FINISHED_THRESHOLD_PERCENT / 100.0 * dur)) or (remaining <= FINISHED_REMAINING_SECONDS)
 
-    xbmc.log(f"TA play: end id={yid} pos={pos}s dur={dur}s finished={int(finished)}", xbmc.LOGINFO)
+    xbmc.log(f"TA play: end id={video_id} pos={pos}s dur={dur}s finished={int(finished)}", xbmc.LOGINFO)
 
     try:
         if finished and dur > 0:
-            _ta_mark_watched(yid, True)
+            _ta_mark_watched(video_id, True)
             # Optional: clear progress on completion
-            # _ta_mark_progress(yid, 0)
+            # _ta_mark_progress(video_id, 0)
         else:
             # Only post real progress (skip tiny or zero positions)
-            if pos >= 5:
-                _ta_mark_progress(yid, pos)
+            if pos >= MIN_PROGRESS_SECONDS:
+                _ta_mark_progress(video_id, pos)
             else:
-                xbmc.log(f"TA play: skipping progress <5s for {yid}", xbmc.LOGINFO)
+                xbmc.log(f"TA play: skipping progress <{MIN_PROGRESS_SECONDS}s for {video_id}", xbmc.LOGINFO)
     except Exception as e:
-        xbmc.log(f"TA play: failed to sync TA for {yid}: {e}", xbmc.LOGWARNING)
+        xbmc.log(f"TA play: failed to sync TA for {video_id}: {e}", xbmc.LOGWARNING)
 
 def handle_play_all():
     """Handle play_all action - fetch all videos from list and start playlist."""
@@ -1254,26 +1301,13 @@ def handle_play_all():
     list_type, entity_id = parts
 
     # Fetch all videos from the list
-    all_videos = []
-    cur = 1
-    while True:
-        if list_type == "channel":
-            data = ta.get(f"video/?channel={entity_id}&page={cur}")
-        elif list_type == "playlist":
-            data = ta.get(f"video/?playlist={entity_id}&page={cur}")
-        else:
-            xbmc.log(f"TubeArchivist: Unknown list_type: {list_type}", xbmc.LOGERROR)
-            return
-
-        vids = data.get("data", [])
-        if not vids:
-            break
-        all_videos.extend(vids)
-        paginate = data.get("paginate") or {}
-        last_page = int(paginate.get("last_page", cur))
-        if cur >= last_page:
-            break
-        cur += 1
+    if list_type == "channel":
+        all_videos = fetch_all_pages(f"video/?channel={entity_id}")
+    elif list_type == "playlist":
+        all_videos = fetch_all_pages(f"video/?playlist={entity_id}")
+    else:
+        xbmc.log(f"TubeArchivist: Unknown list_type: {list_type}", xbmc.LOGERROR)
+        return
 
     # Sort locally
     sort_choice = get_sort_order()
@@ -1308,26 +1342,13 @@ def handle_play_from_here():
     list_type, entity_id = parts
 
     # Fetch all videos from the list
-    all_videos = []
-    cur = 1
-    while True:
-        if list_type == "channel":
-            data = ta.get(f"video/?channel={entity_id}&page={cur}")
-        elif list_type == "playlist":
-            data = ta.get(f"video/?playlist={entity_id}&page={cur}")
-        else:
-            xbmc.log(f"TubeArchivist: Unknown list_type: {list_type}", xbmc.LOGERROR)
-            return
-
-        vids = data.get("data", [])
-        if not vids:
-            break
-        all_videos.extend(vids)
-        paginate = data.get("paginate") or {}
-        last_page = int(paginate.get("last_page", cur))
-        if cur >= last_page:
-            break
-        cur += 1
+    if list_type == "channel":
+        all_videos = fetch_all_pages(f"video/?channel={entity_id}")
+    elif list_type == "playlist":
+        all_videos = fetch_all_pages(f"video/?playlist={entity_id}")
+    else:
+        xbmc.log(f"TubeArchivist: Unknown list_type: {list_type}", xbmc.LOGERROR)
+        return
 
     # Sort locally
     sort_choice = get_sort_order()

@@ -7,8 +7,12 @@ import xbmcplugin
 import xbmc
 import sys
 import threading
+from typing import Optional, Dict, Any
 
 addon = xbmcaddon.Addon()
+
+# Network timeout in seconds
+DEFAULT_TIMEOUT = 20
 
 class TubeArchivist:
     def __init__(self):
@@ -22,7 +26,22 @@ class TubeArchivist:
             return self.server_url + path
         return path
 
-    def get(self, endpoint, params=None):
+    def get(self, endpoint: str, params: Optional[Dict] = None, timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any]:
+        """
+        Perform GET request to TubeArchivist API.
+
+        Args:
+            endpoint: API endpoint path
+            params: Optional query parameters
+            timeout: Request timeout in seconds
+
+        Returns:
+            Parsed JSON response
+
+        Raises:
+            urllib.error.URLError: On network errors
+            json.JSONDecodeError: On invalid JSON response
+        """
         url = self.base_url + endpoint
         if params:
             url += "?" + urllib.parse.urlencode(params)
@@ -33,13 +52,31 @@ class TubeArchivist:
 
         xbmc.log(f"TubeArchivist API GET {url}", xbmc.LOGINFO)
 
-        with urllib.request.urlopen(req) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            xbmc.log(f"TubeArchivist API response: {json.dumps(data)[:100]}", xbmc.LOGDEBUG)
-            return data
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                xbmc.log(f"TubeArchivist API response: {json.dumps(data)[:100]}", xbmc.LOGDEBUG)
+                return data
+        except urllib.error.URLError as e:
+            xbmc.log(f"TubeArchivist API GET error {url}: {e}", xbmc.LOGERROR)
+            raise
+        except json.JSONDecodeError as e:
+            xbmc.log(f"TubeArchivist API GET invalid JSON {url}: {e}", xbmc.LOGERROR)
+            raise
 
-    def post(self, endpoint, data=None, timeout=20):
-        url = self.base_url + endpoint  # keep same joining behavior as get()
+    def post(self, endpoint: str, data: Optional[Dict] = None, timeout: int = DEFAULT_TIMEOUT) -> Dict[str, Any]:
+        """
+        Perform POST request to TubeArchivist API.
+
+        Args:
+            endpoint: API endpoint path
+            data: Optional request body data
+            timeout: Request timeout in seconds
+
+        Returns:
+            Parsed JSON response (empty dict on no content or error)
+        """
+        url = self.base_url + endpoint
         body = json.dumps(data or {}).encode("utf-8")
 
         req = urllib.request.Request(url, data=body, method="POST")
@@ -61,8 +98,12 @@ class TubeArchivist:
         except urllib.error.HTTPError as e:
             msg = e.read().decode("utf-8", "ignore")
             xbmc.log(f"TubeArchivist API POST error {url}: {e.code} {e.reason} {msg}", xbmc.LOGERROR)
+        except urllib.error.URLError as e:
+            xbmc.log(f"TubeArchivist API POST network error {url}: {e}", xbmc.LOGERROR)
+        except json.JSONDecodeError as e:
+            xbmc.log(f"TubeArchivist API POST invalid JSON {url}: {e}", xbmc.LOGERROR)
         except Exception as e:
-            xbmc.log(f"TubeArchivist API POST error {url}: {e}", xbmc.LOGERROR)
+            xbmc.log(f"TubeArchivist API POST unexpected error {url}: {e}", xbmc.LOGERROR)
         return {}    
 
     def sort_param(self):
@@ -153,6 +194,9 @@ class TubeArchivist:
         return self.videos({"search": query})
 
 # --- playback_tracker.py ---
+# NOTE: This class is currently unused. Playback tracking is implemented
+# directly in default.py handle_play() function. This class provides a
+# cleaner alternative implementation if a refactor is desired.
 class TAPlaybackTracker(xbmc.Player):
     def __init__(self, ta):
         super().__init__()
