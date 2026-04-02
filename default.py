@@ -900,6 +900,158 @@ def _ta_mark_watched(video_id: str, is_watched: bool = True):
         xbmc.log(f"TA watched toggle failed for {video_id}: {e}", xbmc.LOGWARNING)
 # ----------------------------------------
 
+# ---------- SponsorBlock helpers ----------
+def _get_sponsorblock_settings():
+    """Read SponsorBlock settings from addon configuration."""
+    if not addon.getSettingBool("sponsorblock_enabled"):
+        return None
+
+    # Map category names to action codes: 0=Skip, 1=Mute, 2=Nothing
+    categories = {
+        "sponsor": int(addon.getSetting("sponsorblock_sponsor") or "0"),
+        "intro": int(addon.getSetting("sponsorblock_intro") or "0"),
+        "outro": int(addon.getSetting("sponsorblock_outro") or "2"),
+        "selfpromo": int(addon.getSetting("sponsorblock_selfpromo") or "2"),
+        "interaction": int(addon.getSetting("sponsorblock_interaction") or "2"),
+        "music_offtopic": int(addon.getSetting("sponsorblock_music_offtopic") or "2"),
+        "preview": int(addon.getSetting("sponsorblock_preview") or "2"),
+        "filler": int(addon.getSetting("sponsorblock_filler") or "2"),
+    }
+
+    return {
+        "enabled": True,
+        "auto_skip": addon.getSettingBool("sponsorblock_auto_skip"),
+        "show_notifications": addon.getSettingBool("sponsorblock_show_notifications"),
+        "categories": categories,
+    }
+
+def _filter_sponsorblock_segments(video_data, settings):
+    """Extract and filter SponsorBlock segments based on user settings."""
+    if not settings or not settings.get("enabled"):
+        return []
+
+    sponsorblock = video_data.get("sponsorblock")
+    if not sponsorblock or not sponsorblock.get("is_enabled"):
+        return []
+
+    segments = sponsorblock.get("segments", [])
+    if not segments:
+        return []
+
+    filtered = []
+    for seg in segments:
+        category = seg.get("category", "")
+        action_type = seg.get("actionType", "skip")
+        segment_times = seg.get("segment", [])
+
+        if len(segment_times) != 2:
+            continue
+
+        # Get user's action preference for this category
+        user_action = settings["categories"].get(category, 2)  # Default to "Nothing"
+
+        # 0=Skip, 1=Mute, 2=Nothing
+        if user_action == 2:
+            continue  # User doesn't want to handle this category
+
+        filtered.append({
+            "start": float(segment_times[0]),
+            "end": float(segment_times[1]),
+            "category": category,
+            "action": "skip" if user_action == 0 else "mute",
+            "uuid": seg.get("UUID", ""),
+        })
+
+    return filtered
+
+def _check_segment_skip(player, segments, segment_state):
+    """
+    Check if current position is in a segment that needs action.
+    Based on the approach from script.service.sponsorblock by siku2.
+
+    Returns: (segment_to_handle, new_segment_state) or (None, segment_state)
+
+    segment_state dict contains:
+    - last_pos: last known position (to detect forward progress)
+    - processed_uuids: set of segment UUIDs we've already skipped
+    """
+    if not segments:
+        return None, segment_state
+
+    try:
+        current_pos = player.getTime()
+    except Exception:
+        return None, segment_state
+
+    last_pos = segment_state.get("last_pos", 0)
+    processed_uuids = segment_state.get("processed_uuids", set())
+
+    # Update state with current position
+    new_state = {
+        "last_pos": current_pos,
+        "processed_uuids": processed_uuids
+    }
+
+    xbmc.log(f"TA SponsorBlock: Checking segments - current_pos={current_pos:.1f}s, last_pos={last_pos:.1f}s", xbmc.LOGDEBUG)
+
+    # Find if we're currently in any segment
+    for seg in segments:
+        seg_uuid = seg["uuid"]
+        seg_start = seg["start"]
+        seg_end = seg["end"]
+
+        # Skip segments that are in the past
+        if seg_end < current_pos:
+            xbmc.log(f"TA SponsorBlock: Segment {seg_uuid[:8]} is in past (ends at {seg_end:.1f}s)", xbmc.LOGDEBUG)
+            continue
+
+        # Check if we're in this segment
+        if seg_start <= current_pos < seg_end:
+            xbmc.log(f"TA SponsorBlock: In segment {seg_uuid[:8]} ({seg_start:.1f}-{seg_end:.1f}s)", xbmc.LOGDEBUG)
+
+            # Already processed this segment? Don't skip again
+            if seg_uuid in processed_uuids:
+                xbmc.log(f"TA SponsorBlock: Segment {seg_uuid[:8]} already processed - ignoring", xbmc.LOGINFO)
+                return None, new_state
+
+            # Are we already in the segment (didn't just enter it naturally)?
+            # This means the user manually seeked into it
+            if seg_start < last_pos < seg_end:
+                xbmc.log(f"TA SponsorBlock: Already in segment {seg_uuid[:8]} (last_pos={last_pos:.1f}s was inside), user likely seeked here - not skipping", xbmc.LOGINFO)
+                return None, new_state
+
+            # We naturally entered this segment - skip it
+            xbmc.log(f"TA SponsorBlock: Naturally entered segment {seg_uuid[:8]} (last_pos={last_pos:.1f}s, seg_start={seg_start:.1f}s), will skip", xbmc.LOGINFO)
+            new_state["processed_uuids"] = processed_uuids | {seg_uuid}
+            return seg, new_state
+
+    # Not in any segment
+    return None, new_state
+
+def _show_sponsorblock_notification(category, action):
+    """Show a toast notification for skipped/muted segment."""
+    category_names = {
+        "sponsor": "Sponsor",
+        "intro": "Intro",
+        "outro": "Outro",
+        "selfpromo": "Self-promotion",
+        "interaction": "Interaction reminder",
+        "music_offtopic": "Music/Off-topic",
+        "preview": "Preview/Recap",
+        "filler": "Filler",
+    }
+
+    category_label = category_names.get(category, category.title())
+    action_label = "Skipped" if action == "skip" else "Muted"
+
+    xbmcgui.Dialog().notification(
+        "SponsorBlock",
+        f"{action_label} {category_label}",
+        xbmcgui.NOTIFICATION_INFO,
+        2000  # 2 second display
+    )
+# ----------------------------------------
+
 
 def handle_play():
     yid = params.get("yid")
@@ -935,7 +1087,18 @@ def handle_play():
 
     xbmcplugin.setResolvedUrl(HANDLE, True, li)
 
-    # 3) Track playback with cached last-known pos/dur
+    # 3) Setup SponsorBlock
+    sb_settings = _get_sponsorblock_settings()
+    sb_segments = _filter_sponsorblock_segments(video, sb_settings) if sb_settings else []
+    sb_state = {
+        "last_pos": 0,
+        "processed_uuids": set()
+    }
+
+    if sb_segments:
+        xbmc.log(f"TA play: SponsorBlock found {len(sb_segments)} segments to monitor", xbmc.LOGINFO)
+
+    # 4) Track playback with cached last-known pos/dur
     player  = xbmc.Player()
     monitor = xbmc.Monitor()
 
@@ -955,6 +1118,7 @@ def handle_play():
 
     last_pos = 0
     last_dur = 0
+    muted_until = 0
 
     # Poll once per second while playing, caching position/duration
     while not monitor.abortRequested() and player.isPlayingVideo():
@@ -965,11 +1129,88 @@ def handle_play():
                 last_pos = pos
             if dur > 0:
                 last_dur = dur
-        except Exception:
-            pass
+
+            # Check if we need to unmute
+            if muted_until > 0 and pos >= muted_until:
+                player.setMuted(False)
+                muted_until = 0
+                xbmc.log(f"TA SponsorBlock: unmuted at {pos}s", xbmc.LOGDEBUG)
+
+            # Check for SponsorBlock segments (state will be updated inside)
+            if sb_segments:
+                segment, sb_state = _check_segment_skip(player, sb_segments, sb_state)
+                if segment:
+                    action = segment["action"]
+                    category = segment["category"]
+                    seg_uuid = segment["uuid"]
+                    auto_skip_enabled = sb_settings.get("auto_skip", True)
+
+                    xbmc.log(f"TA SponsorBlock: Detected {category} segment at {segment['start']:.1f}s (UUID: {seg_uuid[:8]}...) - marking as processed", xbmc.LOGINFO)
+
+                    # Show notification
+                    if sb_settings.get("show_notifications"):
+                        if auto_skip_enabled:
+                            _show_sponsorblock_notification(category, action)
+                        else:
+                            # Notification-only mode
+                            category_names = {
+                                "sponsor": "Sponsor", "intro": "Intro", "outro": "Outro",
+                                "selfpromo": "Self-promotion", "interaction": "Interaction",
+                                "music_offtopic": "Music/Off-topic", "preview": "Preview",
+                                "filler": "Filler"
+                            }
+                            cat_label = category_names.get(category, category.title())
+                            xbmcgui.Dialog().notification(
+                                "SponsorBlock",
+                                f"{cat_label} segment",
+                                xbmcgui.NOTIFICATION_INFO,
+                                3000
+                            )
+
+                    # Auto-skip is enabled - perform the action
+                    if auto_skip_enabled:
+                        if action == "skip":
+                            # Use direct seekTime() like script.service.sponsorblock
+                            try:
+                                skip_to = float(segment["end"])
+                                xbmc.log(f"TA SponsorBlock: Initiating seek to {skip_to:.1f}s", xbmc.LOGINFO)
+
+                                player.seekTime(skip_to)
+
+                                # Wait for seek to complete before continuing monitoring
+                                # Give Kodi time to process the seek and stabilize the stream
+                                xbmc.sleep(1000)  # Increased to 1 second
+
+                                # Wait until player reports a position close to where we seeked
+                                # This ensures the seek actually completed
+                                for _ in range(20):  # Try for up to 2 more seconds
+                                    try:
+                                        current = player.getTime()
+                                        if abs(current - skip_to) < 5:  # Within 5 seconds of target
+                                            xbmc.log(f"TA SponsorBlock: Seek completed, now at {current:.1f}s", xbmc.LOGINFO)
+                                            break
+                                    except:
+                                        pass
+                                    xbmc.sleep(100)
+
+                                xbmc.log(f"TA SponsorBlock: Skip completed. Will not skip this segment again.", xbmc.LOGINFO)
+
+                            except Exception as e:
+                                xbmc.log(f"TA SponsorBlock: seek failed: {e}", xbmc.LOGWARNING)
+
+                        elif action == "mute":
+                            # Mute audio and remember when to unmute
+                            player.setMuted(True)
+                            muted_until = int(segment["end"])
+                            xbmc.log(f"TA SponsorBlock: Muted until {muted_until}s. Will not mute this segment again.", xbmc.LOGINFO)
+                    else:
+                        xbmc.log(f"TA SponsorBlock: Notification-only mode - showing {category} segment", xbmc.LOGINFO)
+
+        except Exception as e:
+            xbmc.log(f"TA play: error during playback monitoring: {e}", xbmc.LOGDEBUG)
         xbmc.sleep(1000)
 
-    # 4) Decide what to send to TubeArchivist using cached values
+    # 5) Decide what to send to TubeArchivist using cached values
     pos = int(last_pos or 0)
     dur = int(last_dur or 0)
 
